@@ -50,14 +50,32 @@ the SDK's `initialize` control handshake for you.
 
 ## Record (capture a real session)
 
-```python
-from claude_agent_cassette import record_sdk_wire, serialize_tape
-from claude_agent_sdk import query
-from pathlib import Path
+`record_sdk_wire()` works with **both** SDK entry points — the one-shot `query()`
+and the interactive `ClaudeSDKClient` (it patches both transport-construction
+sites the SDK uses):
 
-with record_sdk_wire() as tape:                 # tees the full duplex wire
+```python
+from pathlib import Path
+from claude_agent_cassette import record_sdk_wire, serialize_tape
+
+# one-shot query()
+from claude_agent_sdk import query
+
+with record_sdk_wire() as tape:                  # tees the full duplex wire
     async for _ in query(prompt="...", options=...):
         pass
+Path("session.jsonl").write_text(serialize_tape(tape))
+```
+
+```python
+# interactive ClaudeSDKClient
+from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
+
+with record_sdk_wire() as tape:
+    async with ClaudeSDKClient(options=ClaudeAgentOptions()) as client:
+        await client.query("...")
+        async for _ in client.receive_messages():
+            pass
 Path("session.jsonl").write_text(serialize_tape(tape))
 ```
 
@@ -66,6 +84,21 @@ Path("session.jsonl").write_text(serialize_tape(tape))
 handshake), so one recording can feed both conversation replay and
 control-protocol replay. Derive a conversation cassette with
 `conversation_messages(tape)`.
+
+## Examples
+
+[`examples/`](examples/) has a runnable, no-key demo:
+
+```bash
+python examples/replay_cassette.py
+# AssistantMessage:
+# ResultMessage: Hello! How can I help?
+```
+
+It replays the saved [`examples/cassettes/hello_world.jsonl`](examples/cassettes/hello_world.jsonl)
+through a real `ClaudeSDKClient`. (That cassette is a small, illustrative
+hand-written sample with realistic wire shapes; real cassettes are *recorded* —
+see above.)
 
 ## API
 
