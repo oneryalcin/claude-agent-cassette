@@ -1,4 +1,4 @@
-# claude-agent-cassette
+# Claude Agent Cassette
 
 Record & replay the [`claude-agent-sdk`](https://github.com/anthropics/claude-agent-sdk-python)
 wire for **deterministic, offline tests** — no API key, no subprocess, no mocks.
