@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "claude-agent-cassette"
+version = "0.1.0"
+description = "Record & replay the claude-agent-sdk wire for deterministic, offline tests."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [{ name = "Mehmet Öner Yalçın" }]
+keywords = ["claude", "claude-agent-sdk", "testing", "vcr", "cassette", "replay"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Software Development :: Testing",
+]
+dependencies = [
+    # Pinned to the tested range: record mode touches claude_agent_sdk._internal,
+    # which can change across minor versions. Replay rides the public Transport ABC.
+    "claude-agent-sdk>=0.2.82,<0.3",
+    "typing-extensions>=4.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.23"]
+
+[project.urls]
+Homepage = "https://github.com/oneryalcin/claude-agent-cassette"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/claude_agent_cassette"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

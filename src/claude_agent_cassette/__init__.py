@@ -1,0 +1,38 @@
+"""claude-agent-cassette — record & replay the claude-agent-sdk wire for tests.
+
+Replay recorded SDK message streams through the *real* parser and client, with
+no API key and no subprocess, so your tests are deterministic and offline — and
+catch the "the SDK sent a slightly different shape than we expected" class of
+bug that mocked tests can't.
+"""
+
+from .record import record_sdk_wire
+from .replay import replay
+from .tape import (
+    Direction,
+    RawMessage,
+    TapeEntry,
+    conversation_messages,
+    load_cassette,
+    load_tape,
+    read_frames,
+    serialize_tape,
+)
+from .transport import RecordingTransport, ReplayTransport
+
+__version__ = "0.1.0"
+
+__all__ = [
+    "ReplayTransport",
+    "RecordingTransport",
+    "replay",
+    "record_sdk_wire",
+    "TapeEntry",
+    "Direction",
+    "RawMessage",
+    "serialize_tape",
+    "load_tape",
+    "load_cassette",
+    "read_frames",
+    "conversation_messages",
+]
