@@ -130,6 +130,13 @@ Replay uses only the public `Transport` API. **Record reaches into
 shape), so it is version-sensitive — this release targets `claude-agent-sdk
 0.2.x`. Pin your SDK and re-verify on bumps.
 
+## Roadmap
+
+See [ROADMAP.md](ROADMAP.md). Next up: **control-protocol replay** (faithfully
+replaying the captured `can_use_tool`/`hook_callback`/`mcp_message`/`interrupt`
+frames), a pytest plugin with record-on-miss, drift detection, and a cassette
+redaction helper.
+
 ## License
 
 MIT.
