@@ -5,8 +5,44 @@ from __future__ import annotations
 import asyncio
 import json
 
-from claude_agent_cassette import RecordingTransport, ReplayTransport, replay, serialize_tape
+from claude_agent_cassette import (
+    RecordingTransport,
+    ReplayTransport,
+    record_sdk_wire,
+    replay,
+    serialize_tape,
+)
 from claude_agent_cassette.tape import conversation_messages
+
+
+def test_record_sdk_wire_intercepts_both_query_and_client_paths():
+    """record_sdk_wire must wrap the transport for BOTH reach-the-transport paths.
+
+    ClaudeSDKClient._connect_inner does a call-time import from the source module;
+    one-shot query()/InternalClient.process_query uses the name bound in
+    _internal.client. Patching one silently misses the other (it did, once).
+    Construction here does not spawn the CLI, so no API key is needed.
+    """
+    from claude_agent_sdk import ClaudeAgentOptions
+
+    with record_sdk_wire():
+        # ClaudeSDKClient path: call-time import from the source module
+        from claude_agent_sdk._internal.transport.subprocess_cli import (
+            SubprocessCLITransport as ViaSource,
+        )
+        import claude_agent_sdk._internal.client as client_mod
+
+        via_client_path = ViaSource(prompt="probe", options=ClaudeAgentOptions())
+        via_query_path = client_mod.SubprocessCLITransport(prompt="probe", options=ClaudeAgentOptions())
+        assert isinstance(via_client_path, RecordingTransport)  # ClaudeSDKClient
+        assert isinstance(via_query_path, RecordingTransport)  # query()
+
+    # constructor restored on exit
+    from claude_agent_sdk._internal.transport.subprocess_cli import (
+        SubprocessCLITransport as AfterExit,
+    )
+
+    assert AfterExit.__name__ == "SubprocessCLITransport"
 
 SESSION = [
     {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "hi"}], "model": "m"}, "session_id": "s1"},
