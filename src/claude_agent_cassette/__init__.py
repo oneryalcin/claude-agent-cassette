@@ -12,19 +12,23 @@ from .tape import (
     Direction,
     RawMessage,
     TapeEntry,
+    control_request_subtype,
+    control_responses_by_subtype,
     conversation_messages,
     load_cassette,
     load_tape,
     read_frames,
+    replayable_messages,
     serialize_tape,
 )
-from .transport import RecordingTransport, ReplayTransport
+from .transport import CassetteMismatchError, RecordingTransport, ReplayTransport
 
-__version__ = "0.1.1"
+__version__ = "0.2.0"
 
 __all__ = [
     "ReplayTransport",
     "RecordingTransport",
+    "CassetteMismatchError",
     "replay",
     "record_sdk_wire",
     "TapeEntry",
@@ -35,4 +39,7 @@ __all__ = [
     "load_cassette",
     "read_frames",
     "conversation_messages",
+    "replayable_messages",
+    "control_responses_by_subtype",
+    "control_request_subtype",
 ]

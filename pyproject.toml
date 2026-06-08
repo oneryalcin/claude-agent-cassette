@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "claude-agent-cassette"
-version = "0.1.1"
+version = "0.2.0"
 description = "Record & replay the claude-agent-sdk wire for deterministic, offline tests."
 readme = "README.md"
 license = { text = "MIT" }
