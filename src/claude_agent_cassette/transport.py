@@ -38,17 +38,62 @@ class ReplayTransport(Transport):
     ``control_request`` with a freshly-minted ``request_id`` and blocks until
     ``read_messages()`` yields a ``control_response`` echoing that exact id. So
     this transport is not purely passive: it reads the live id off ``write()``
-    and synthesises the matching response before streaming the recorded frames.
+    and answers before streaming the recorded frames.
+
+    Two construction paths:
+
+    - ``ReplayTransport(messages)`` — conversation-only replay. Every
+      ``control_request`` is answered with a synthesised generic success; no
+      control-plane fidelity.
+    - ``ReplayTransport.from_tape(tape)`` — replay a full duplex recording.
+      Direction-A control_requests the SDK sends (``initialize``, ``mcp_status``,
+      …) are answered from the *recorded* ``control_response`` (id-remapped to the
+      live request), and inbound Direction-B control_requests
+      (``mcp_message``/``hook_callback``/``can_use_tool``) are dropped so no live
+      callback fires — replay stays inert. Control_responses are demuxed by the
+      SDK on ``request_id`` independent of conversation order, so the recorded
+      responses are answered as the SDK issues each request; no lockstep needed.
+      Ordering-sensitive control (``interrupt``) is a separate concern — see the
+      module docs / issue tracker.
     """
 
-    def __init__(self, messages: list[RawMessage]) -> None:
+    def __init__(
+        self,
+        messages: list[RawMessage],
+        recorded_responses: Optional[list[RawMessage]] = None,
+    ) -> None:
         self._messages = messages
+        # Recorded Direction-A control_responses, in order. When present, each
+        # SDK control_request is answered from the next one (id-remapped) instead
+        # of a synthesised success. None -> legacy generic-success behaviour.
+        self._recorded_responses = recorded_responses
+        self._response_idx = 0
         self._queue: asyncio.Queue[Any] = asyncio.Queue()
         self._ready = False
         self._streamed = False
         self._ended = False
         # Exposed for write-side assertions (e.g. that initialize was sent).
         self.writes: list[str] = []
+
+    @classmethod
+    def from_tape(cls, tape: list["TapeEntry"]) -> "ReplayTransport":
+        """Build a control-aware replay from a full duplex tape.
+
+        - ``messages``: inbound conversation/system frames — every inbound frame
+          that is neither a ``control_request`` (Direction B, dropped to stay
+          inert) nor a ``control_response`` (answered separately, below).
+        - ``recorded_responses``: inbound ``control_response`` frames, in order —
+          the recorded answers to the SDK's Direction-A requests.
+        """
+        inbound = [e["frame"] for e in tape if e.get("dir") == "read"]
+        messages = [
+            f for f in inbound
+            if f.get("type") not in ("control_request", "control_response")
+        ]
+        recorded_responses = [
+            f for f in inbound if f.get("type") == "control_response"
+        ]
+        return cls(messages, recorded_responses=recorded_responses)
 
     async def connect(self) -> None:
         self._ready = True
@@ -66,13 +111,30 @@ class ReplayTransport(Transport):
             await self._answer_control_request(message)
 
     async def _answer_control_request(self, request: RawMessage) -> None:
-        # Echo a success control_response for the live request id (unblocks the
-        # client's connect), then stream the recorded conversation exactly once.
-        await self._queue.put(_control_response(request.get("request_id")))
+        # Answer for the live request id (unblocks the SDK, which demuxes the
+        # response by request_id), then stream the recorded conversation once.
+        live_id = request.get("request_id")
+        await self._queue.put(self._response_for(live_id))
         if not self._streamed:
             self._streamed = True
             for raw in self._messages:
                 await self._queue.put(raw)
+
+    def _response_for(self, live_id: Optional[str]) -> RawMessage:
+        """The control_response to return for an SDK request id.
+
+        With a recorded tape, hand back the next recorded ``control_response``
+        (deep-copied, with its ``request_id`` remapped to the live one the SDK
+        minted this run); otherwise synthesise a generic success. Falls back to
+        generic success if the SDK issues more requests than were recorded.
+        """
+        if self._recorded_responses and self._response_idx < len(self._recorded_responses):
+            rec = json.loads(json.dumps(self._recorded_responses[self._response_idx]))
+            self._response_idx += 1
+            if isinstance(rec.get("response"), dict):
+                rec["response"]["request_id"] = live_id
+            return rec
+        return _control_response(live_id)
 
     async def read_messages(self):
         while True:
