@@ -85,6 +85,18 @@ class ReplayTransport(Transport):
       Ordering-sensitive control (``interrupt``), where a conversation frame must
       land after a control exchange, needs lockstep interleaving and is out of
       scope here — see the issue tracker.
+
+      **Flow-control constraint (same as the real transport):** a control method
+      issued *during* replay (``client.get_mcp_status()``, ``set_model()``, …)
+      only resolves while ``receive_messages()`` is being drained concurrently.
+      The SDK forwards replayed frames into a bounded inbound buffer; if a tape
+      has more replayable frames than that buffer and nothing is draining them,
+      the read loop blocks and a later control response cannot be delivered — the
+      control call then hangs. This is the real CLI's back-pressure faithfully
+      reproduced (an undrained stdout pipe stalls the same way), not a replay
+      artefact. The supported pattern is: drive ``connect()`` then drain
+      ``receive_messages()`` (optionally issuing control calls from a concurrent
+      task). Removing the constraint entirely is the lockstep work (see tracker).
     """
 
     def __init__(

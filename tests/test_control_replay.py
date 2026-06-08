@@ -161,3 +161,53 @@ async def test_legacy_messages_path_still_synthesises_success():
     transport = ReplayTransport([_RESULT])
     types = await asyncio.wait_for(_drive(transport), _DRIVE_TIMEOUT_S)
     assert types == ["ResultMessage"]
+
+
+# --- Flow control: the supported pattern (drain, optionally with concurrent
+# control) must work even for tapes larger than the SDK's inbound buffer (~100).
+# A control call issued WITHOUT a concurrent drain back-pressures and hangs, the
+# same as the real CLI with an undrained stdout — that misuse is documented, not
+# tested here. ---
+
+_ASSISTANT = {"type": "assistant", "message": {
+    "role": "assistant", "content": [{"type": "text", "text": "x"}], "model": "m"},
+    "session_id": "s"}
+
+
+def _big_tape():
+    """initialize + 101 conversation frames (> the SDK buffer) + a recorded
+    mcp_status response + terminal result."""
+    w, r = _init_pair()
+    mcp_w = {"dir": "write", "data": json.dumps(
+        {"type": "control_request", "request_id": "rm",
+         "request": {"subtype": "mcp_status"}})}
+    mcp_r = {"dir": "read", "frame": {"type": "control_response", "response": {
+        "subtype": "success", "request_id": "rm", "response": {"servers": []}}}}
+    convo = [{"dir": "read", "frame": _ASSISTANT}] * 101 + [{"dir": "read", "frame": _RESULT}]
+    return [w, r, *convo, mcp_w, mcp_r]
+
+
+async def test_large_tape_replays_when_drained():
+    """A tape larger than the SDK inbound buffer replays to completion when drained."""
+    transport = ReplayTransport.from_tape(_big_tape())
+    types = await asyncio.wait_for(_drive(transport), _DRIVE_TIMEOUT_S)
+    assert types[-1] == "ResultMessage"
+    assert types.count("AssistantMessage") == 101
+
+
+async def test_control_call_resolves_while_draining_large_tape():
+    """get_mcp_status() resolves mid-replay as long as messages are being drained
+    concurrently — the recorded mcp_status answer is delivered, no deadlock."""
+    transport = ReplayTransport.from_tape(_big_tape())
+    client = ClaudeSDKClient(options=ClaudeAgentOptions(), transport=transport)
+    await asyncio.wait_for(client.connect(), _DRIVE_TIMEOUT_S)
+
+    async def drain():
+        async for m in client.receive_messages():
+            if type(m).__name__ == "ResultMessage":
+                break
+
+    drainer = asyncio.create_task(drain())
+    await asyncio.wait_for(client.get_mcp_status(), _DRIVE_TIMEOUT_S)  # must not hang
+    await asyncio.wait_for(drainer, _DRIVE_TIMEOUT_S)
+    await client.disconnect()
