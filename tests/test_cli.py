@@ -68,6 +68,18 @@ def test_raw_frame_cassette_clean_passes(capsys, tmp_path):
     assert "no drift" in capsys.readouterr().out
 
 
+def test_no_cassettes_found_fails_closed(capsys, tmp_path):
+    """A gate that checked nothing must NOT report success (empty/mispointed dir)."""
+    rc = main(["drift", str(tmp_path)])  # existing dir, no *.jsonl
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "nothing checked" in err
+
+
+def test_allow_empty_opt_in(capsys, tmp_path):
+    assert main(["drift", str(tmp_path), "--allow-empty"]) == 0
+
+
 def test_no_command_errors():
     import pytest
     with pytest.raises(SystemExit):

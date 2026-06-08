@@ -43,9 +43,19 @@ def _load_frames(path: Path) -> list[RawMessage]:
     return message_frames(entries)  # raw inbound-frame cassette
 
 
-def _drift(paths: list[str], out) -> int:
+def _drift(paths: list[str], out, allow_empty: bool = False) -> int:
     sdk_version = getattr(claude_agent_sdk, "__version__", "?")
     tapes = _collect_tapes(paths)
+    if not tapes and not allow_empty:
+        # Fail closed: a gate that checked nothing must not report success — an
+        # empty/mispointed path would otherwise be a false green on an SDK bump.
+        print(
+            f"drift: no cassette files found in {paths} — nothing checked.\n"
+            "(expected tape *.jsonl files or directories containing them; "
+            "pass --allow-empty to treat this as success)",
+            file=sys.stderr,
+        )
+        return 2
     print(f"drift: {len(tapes)} cassette(s) vs claude-agent-sdk {sdk_version}\n", file=out)
 
     drifted_frames = 0
@@ -76,9 +86,13 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     drift = sub.add_parser("drift", help="re-parse cassettes through the installed SDK")
     drift.add_argument("paths", nargs="+", help="tape .jsonl files, or dirs of them")
+    drift.add_argument(
+        "--allow-empty", action="store_true",
+        help="exit 0 instead of failing when no cassette files are found",
+    )
     args = parser.parse_args(argv)
     if args.command == "drift":
-        return _drift(args.paths, sys.stdout)
+        return _drift(args.paths, sys.stdout, allow_empty=args.allow_empty)
     parser.error(f"unknown command {args.command!r}")  # pragma: no cover
 
 
