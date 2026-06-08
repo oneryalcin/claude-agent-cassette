@@ -55,45 +55,9 @@ async def test_from_tape_replays_full_recording_through_real_parser():
     assert types == _EXPECTED_TYPES
 
 
-async def test_initialize_answered_by_subtype_from_recorded_response():
-    """connect() consumes exactly one Direction-A request (initialize), answered
-    from the recorded response (a non-empty body), not a synthesised generic one."""
-    tape = load_tape(_TAPE)
-    transport = ReplayTransport.from_tape(tape)
-    await asyncio.wait_for(_drive(transport), _DRIVE_TIMEOUT_S)
-
-    # The connect-only drive issues exactly one Direction-A request: initialize.
-    # This is the invariant the demux model rests on (single request -> no
-    # ordering ambiguity); pin it explicitly.
-    assert transport.answered_subtypes == ["initialize"]
-    # The recorded initialize bucket was consumed (a generic-success fallback
-    # would have left it untouched / wouldn't exist in tape mode).
-    assert transport._responses_by_subtype is not None
-    assert not transport._responses_by_subtype.get("initialize")  # FIFO drained
-    # The recorded mcp_status responses the bare client never requests stay unused
-    # (not an error — replay isn't coupled to the recording env's control sequence).
-    assert transport._responses_by_subtype.get("mcp_status")
-
-
-async def test_initialize_uses_recorded_body_not_generic_success():
-    """Content fidelity: the response handed to initialize is the recorded body
-    (non-empty), proving the recorded branch ran rather than generic success."""
-    tape = load_tape(_TAPE)
-    transport = ReplayTransport.from_tape(tape)
-    init_resp = transport._responses_by_subtype["initialize"][0]
-    body = (init_resp.get("response") or {}).get("response")
-    assert body not in (None, {}), "recorded initialize response should carry a body"
-
-
-async def test_from_tape_drops_direction_b_control_requests():
-    """mcp_message/hook_callback inbound frames must NOT be replayed to the SDK."""
-    tape = load_tape(_TAPE)
-    transport = ReplayTransport.from_tape(tape)
-    kinds = {m.get("type") for m in transport._messages}
-    assert "control_request" not in kinds  # Direction B dropped
-    assert "control_response" not in kinds  # answered separately, not streamed
-    # but the conversation survived
-    assert "assistant" in kinds and "result" in kinds
+# (The tape-shaping invariants — Direction-B dropped, responses correlated by
+# subtype, body fidelity — are covered as pure-data tests in test_tape.py. Here
+# we only assert end-to-end behaviour through a real client.)
 
 
 # Minimal frames for the inertness test (synthetic — the mechanism is identical

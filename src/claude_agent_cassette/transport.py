@@ -15,12 +15,18 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
-from collections import defaultdict, deque
+from collections import deque
 from typing import Any, Optional
 
 from claude_agent_sdk import Transport
 
-from .tape import RawMessage, TapeEntry, read_frames
+from .tape import (
+    RawMessage,
+    TapeEntry,
+    control_request_subtype,
+    control_responses_by_subtype,
+    replayable_messages,
+)
 
 # End-of-stream sentinel on the internal queue — a module-level singleton so
 # identity comparison is unambiguous and never collides with a real frame.
@@ -84,7 +90,7 @@ class ReplayTransport(Transport):
     def __init__(
         self,
         messages: list[RawMessage],
-        recorded_responses_by_subtype: Optional[dict[str, "deque[RawMessage]"]] = None,
+        recorded_responses_by_subtype: Optional[dict[str, deque[RawMessage]]] = None,
     ) -> None:
         self._messages = messages
         # Recorded Direction-A control_responses, keyed by the subtype of the
@@ -97,49 +103,16 @@ class ReplayTransport(Transport):
         self._ended = False
         # Exposed for write-side assertions (e.g. that initialize was sent).
         self.writes: list[str] = []
-        # Observable for tests: the subtype of each Direction-A request answered.
-        self.answered_subtypes: list[Optional[str]] = []
 
     @classmethod
-    def from_tape(cls, tape: list["TapeEntry"]) -> "ReplayTransport":
+    def from_tape(cls, tape: list[TapeEntry]) -> ReplayTransport:
         """Build a control-aware replay from a full duplex tape.
 
-        - ``messages``: inbound conversation/system frames — every inbound frame
-          that is neither a ``control_request`` (Direction B, dropped to stay
-          inert) nor a ``control_response`` (answered separately, below).
-        - ``recorded_responses_by_subtype``: the recorded ``control_response`` for
-          each Direction-A request, keyed by that request's ``subtype``. Built by
-          correlating each recorded SDK control_request (an outbound ``write``)
-          with its recorded ``control_response`` on the recorded ``request_id``.
+        A thin assembler over the tape's control-protocol view: the conversation
+        to stream (:func:`replayable_messages`) and the recorded Direction-A
+        answers keyed by request subtype (:func:`control_responses_by_subtype`).
         """
-        inbound = read_frames(tape)
-        messages = [
-            f for f in inbound
-            if f.get("type") not in ("control_request", "control_response")
-        ]
-        # recorded control_responses, indexed by their recorded request_id
-        responses_by_recorded_id = {
-            (f.get("response") or {}).get("request_id"): f
-            for f in inbound
-            if f.get("type") == "control_response"
-        }
-        # join each recorded SDK control_request (write) to its response by id,
-        # bucketed by the request subtype (preserving order within a subtype)
-        by_subtype: dict[str, deque[RawMessage]] = defaultdict(deque)
-        for entry in tape:
-            if entry.get("dir") != "write":
-                continue
-            try:
-                req = json.loads(entry["data"])
-            except (TypeError, ValueError, KeyError):
-                continue
-            if req.get("type") != "control_request":
-                continue
-            subtype = (req.get("request") or {}).get("subtype")
-            resp = responses_by_recorded_id.get(req.get("request_id"))
-            if subtype is not None and resp is not None:
-                by_subtype[subtype].append(resp)
-        return cls(messages, recorded_responses_by_subtype=dict(by_subtype))
+        return cls(replayable_messages(tape), control_responses_by_subtype(tape))
 
     async def connect(self) -> None:
         self._ready = True
@@ -160,8 +133,7 @@ class ReplayTransport(Transport):
         # Answer for the live request id (the SDK demuxes the response by
         # request_id), then stream the recorded conversation once.
         live_id = request.get("request_id")
-        subtype = (request.get("request") or {}).get("subtype")
-        self.answered_subtypes.append(subtype)
+        subtype = control_request_subtype(request)
         await self._queue.put(self._response_for(subtype, live_id))
         if not self._streamed:
             self._streamed = True
