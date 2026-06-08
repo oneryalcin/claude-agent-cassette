@@ -48,6 +48,26 @@ def test_reports_installed_sdk_version(capsys):
     assert "claude-agent-sdk" in capsys.readouterr().out
 
 
+def test_raw_frame_cassette_is_detected_not_silently_passed(capsys, tmp_path):
+    """A raw inbound-frame cassette (no dir/frame envelope) with a renamed type must
+    be flagged — previously load_tape filtered it to nothing and reported 'no drift'."""
+    raw = tmp_path / "raw_cassette.jsonl"
+    raw.write_text(json.dumps({"type": "assistant_RENAMED", "message": {}}) + "\n")
+    rc = main(["drift", str(raw)])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "unrecognized_type" in out
+
+
+def test_raw_frame_cassette_clean_passes(capsys, tmp_path):
+    raw = tmp_path / "ok.jsonl"
+    raw.write_text(json.dumps(
+        {"type": "assistant", "session_id": "s",
+         "message": {"model": "m", "content": [{"type": "text", "text": "x"}]}}) + "\n")
+    assert main(["drift", str(raw)]) == 0
+    assert "no drift" in capsys.readouterr().out
+
+
 def test_no_command_errors():
     import pytest
     with pytest.raises(SystemExit):

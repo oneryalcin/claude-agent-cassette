@@ -10,13 +10,14 @@ any drift is found, so it can gate a bump PR.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
 import claude_agent_sdk
 
-from .drift import check_tape
-from .tape import load_tape
+from .drift import parse_drift
+from .tape import RawMessage, message_frames, replayable_messages
 
 
 def _collect_tapes(paths: list[str]) -> list[Path]:
@@ -31,6 +32,17 @@ def _collect_tapes(paths: list[str]) -> list[Path]:
     return files
 
 
+def _load_frames(path: Path) -> list[RawMessage]:
+    """Message frames to drift-check from a cassette file, auto-detecting format:
+    a full duplex tape (entries carry ``dir``) or a raw inbound-frame cassette
+    (``examples/cassettes/*.jsonl``). Treating every file as a tape silently
+    yielded zero frames for raw cassettes — and so 'no drift' for anything."""
+    entries = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    if entries and isinstance(entries[0], dict) and "dir" in entries[0]:
+        return replayable_messages(entries)  # full duplex tape
+    return message_frames(entries)  # raw inbound-frame cassette
+
+
 def _drift(paths: list[str], out) -> int:
     sdk_version = getattr(claude_agent_sdk, "__version__", "?")
     tapes = _collect_tapes(paths)
@@ -39,7 +51,7 @@ def _drift(paths: list[str], out) -> int:
     drifted_frames = 0
     drifted_tapes = 0
     for tape_path in tapes:
-        findings = check_tape(load_tape(tape_path))
+        findings = parse_drift(_load_frames(tape_path))
         if not findings:
             print(f"  ok    {tape_path}", file=out)
             continue
