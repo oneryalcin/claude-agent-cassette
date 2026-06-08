@@ -21,6 +21,7 @@ from .tape import (
     replayable_messages,
     serialize_tape,
 )
+from .drift import DriftFinding, check_tape, parse_drift
 from .transport import CassetteMismatchError, RecordingTransport, ReplayTransport
 
 __version__ = "0.2.0"
@@ -42,4 +43,7 @@ __all__ = [
     "replayable_messages",
     "control_responses_by_subtype",
     "control_request_subtype",
+    "parse_drift",
+    "check_tape",
+    "DriftFinding",
 ]

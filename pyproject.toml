@@ -29,6 +29,9 @@ dev = ["pytest>=8", "pytest-asyncio>=0.23"]
 [project.urls]
 Homepage = "https://github.com/oneryalcin/claude-agent-cassette"
 
+[project.scripts]
+claude-agent-cassette = "claude_agent_cassette.cli:main"
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/claude_agent_cassette"]
 
