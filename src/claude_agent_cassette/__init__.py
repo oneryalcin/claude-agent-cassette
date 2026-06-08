@@ -18,13 +18,14 @@ from .tape import (
     read_frames,
     serialize_tape,
 )
-from .transport import RecordingTransport, ReplayTransport
+from .transport import CassetteMismatchError, RecordingTransport, ReplayTransport
 
 __version__ = "0.2.0"
 
 __all__ = [
     "ReplayTransport",
     "RecordingTransport",
+    "CassetteMismatchError",
     "replay",
     "record_sdk_wire",
     "TapeEntry",

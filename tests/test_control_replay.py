@@ -19,9 +19,10 @@ import asyncio
 import json
 from pathlib import Path
 
+import pytest
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
 
-from claude_agent_cassette import ReplayTransport
+from claude_agent_cassette import CassetteMismatchError, ReplayTransport
 from claude_agent_cassette.tape import load_tape
 
 _TAPE = Path(__file__).parent / "fixtures" / "websearch_control_tape.jsonl"
@@ -54,23 +55,34 @@ async def test_from_tape_replays_full_recording_through_real_parser():
     assert types == _EXPECTED_TYPES
 
 
-async def test_initialize_answered_from_recorded_response():
-    """connect() completes from the recorded control_response (not generic success)."""
+async def test_initialize_answered_by_subtype_from_recorded_response():
+    """connect() consumes exactly one Direction-A request (initialize), answered
+    from the recorded response (a non-empty body), not a synthesised generic one."""
     tape = load_tape(_TAPE)
     transport = ReplayTransport.from_tape(tape)
-    # The fixture records 3 control_responses; the bare client consumes the first
-    # (initialize). Pre-condition: they were actually loaded.
-    assert transport._recorded_responses
     await asyncio.wait_for(_drive(transport), _DRIVE_TIMEOUT_S)
 
-    def _is_initialize(raw: str) -> bool:
-        try:
-            return json.loads(raw).get("request", {}).get("subtype") == "initialize"
-        except (ValueError, AttributeError):
-            return False
+    # The connect-only drive issues exactly one Direction-A request: initialize.
+    # This is the invariant the demux model rests on (single request -> no
+    # ordering ambiguity); pin it explicitly.
+    assert transport.answered_subtypes == ["initialize"]
+    # The recorded initialize bucket was consumed (a generic-success fallback
+    # would have left it untouched / wouldn't exist in tape mode).
+    assert transport._responses_by_subtype is not None
+    assert not transport._responses_by_subtype.get("initialize")  # FIFO drained
+    # The recorded mcp_status responses the bare client never requests stay unused
+    # (not an error — replay isn't coupled to the recording env's control sequence).
+    assert transport._responses_by_subtype.get("mcp_status")
 
-    assert any(_is_initialize(w) for w in transport.writes)
-    assert transport._response_idx >= 1  # at least the initialize response was used
+
+async def test_initialize_uses_recorded_body_not_generic_success():
+    """Content fidelity: the response handed to initialize is the recorded body
+    (non-empty), proving the recorded branch ran rather than generic success."""
+    tape = load_tape(_TAPE)
+    transport = ReplayTransport.from_tape(tape)
+    init_resp = transport._responses_by_subtype["initialize"][0]
+    body = (init_resp.get("response") or {}).get("response")
+    assert body not in (None, {}), "recorded initialize response should carry a body"
 
 
 async def test_from_tape_drops_direction_b_control_requests():
@@ -127,7 +139,61 @@ async def test_direction_b_drop_keeps_replay_inert_for_registered_callbacks():
     assert fired == ["Bash"], "control: callback should fire when Direction-B is replayed"
 
     # WITH from_tape: the can_use_tool frame is dropped -> callback never fires (inert).
-    tape = [{"dir": "read", "frame": _CAN_USE_TOOL}, {"dir": "read", "frame": _RESULT}]
+    # (A valid initialize exchange is required now that tape mode is fail-closed.)
+    init_w, init_r = _init_pair()
+    tape = [init_w, init_r,
+            {"dir": "read", "frame": _CAN_USE_TOOL}, {"dir": "read", "frame": _RESULT}]
     opts, fired = await make_options()
     await asyncio.wait_for(drive(ReplayTransport.from_tape(tape), opts), _DRIVE_TIMEOUT_S)
     assert fired == [], "from_tape must drop Direction-B so no live callback fires"
+
+
+# --- Fail-closed: tape mode must surface divergence, never absorb it silently ---
+
+
+def _init_pair(subtype: str = "success", body: dict | None = None):
+    """A recorded (initialize request write, control_response read) pair."""
+    write = {"dir": "write", "data": json.dumps(
+        {"type": "control_request", "request_id": "rec_init",
+         "request": {"subtype": "initialize"}})}
+    read = {"dir": "read", "frame": {"type": "control_response", "response": {
+        "subtype": subtype, "request_id": "rec_init", "response": body or {}}}}
+    return write, read
+
+
+async def test_empty_tape_fails_closed():
+    """from_tape([]) has no recorded initialize response -> connect() must raise,
+    not synthesise success (that would be fail-open — the drift a cassette catches)."""
+    transport = ReplayTransport.from_tape([])
+    client = ClaudeSDKClient(options=ClaudeAgentOptions(), transport=transport)
+    with pytest.raises(CassetteMismatchError):
+        await asyncio.wait_for(client.connect(), _DRIVE_TIMEOUT_S)
+
+
+async def test_missing_initialize_response_fails_closed():
+    """A tape with conversation but no recorded initialize exchange -> fail-closed."""
+    tape = [{"dir": "read", "frame": _RESULT}]
+    transport = ReplayTransport.from_tape(tape)
+    client = ClaudeSDKClient(options=ClaudeAgentOptions(), transport=transport)
+    with pytest.raises(CassetteMismatchError):
+        await asyncio.wait_for(client.connect(), _DRIVE_TIMEOUT_S)
+
+
+async def test_error_subtype_recorded_response_is_replayed_faithfully():
+    """A recorded error-subtype initialize response is replayed as-is; the SDK
+    raises on it (faithful replay of a failed handshake, not swallowed)."""
+    write, read = _init_pair(subtype="error")
+    read["frame"]["response"]["error"] = "recorded handshake failure"
+    transport = ReplayTransport.from_tape([write, read])
+    client = ClaudeSDKClient(options=ClaudeAgentOptions(), transport=transport)
+    with pytest.raises(Exception) as exc:  # SDK raises (not CassetteMismatchError)
+        await asyncio.wait_for(client.connect(), _DRIVE_TIMEOUT_S)
+    assert not isinstance(exc.value, CassetteMismatchError)
+
+
+async def test_legacy_messages_path_still_synthesises_success():
+    """Backward compat: ReplayTransport(messages) (no tape) keeps generic-success;
+    an empty message list connects and ends cleanly, never fail-closed."""
+    transport = ReplayTransport([_RESULT])
+    types = await asyncio.wait_for(_drive(transport), _DRIVE_TIMEOUT_S)
+    assert types == ["ResultMessage"]

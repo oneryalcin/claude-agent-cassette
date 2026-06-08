@@ -13,16 +13,29 @@ them exactly as it would the real subprocess transport.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
+from collections import defaultdict, deque
 from typing import Any, Optional
 
 from claude_agent_sdk import Transport
 
-from .tape import RawMessage, TapeEntry
+from .tape import RawMessage, TapeEntry, read_frames
 
 # End-of-stream sentinel on the internal queue — a module-level singleton so
 # identity comparison is unambiguous and never collides with a real frame.
 _END = object()
+
+
+class CassetteMismatchError(Exception):
+    """A tape replay diverged from the recording.
+
+    Raised by ``ReplayTransport.from_tape`` when the live SDK issues a Direction-A
+    control_request whose ``subtype`` has no (remaining) recorded response — i.e.
+    the live control sequence no longer matches the tape (SDK drift, a broadened
+    caller, or a truncated recording). Fail-closed: surfacing the divergence is
+    the point of a cassette, so it is never silently absorbed.
+    """
 
 
 class ReplayTransport(Transport):
@@ -47,33 +60,45 @@ class ReplayTransport(Transport):
       control-plane fidelity.
     - ``ReplayTransport.from_tape(tape)`` — replay a full duplex recording.
       Direction-A control_requests the SDK sends (``initialize``, ``mcp_status``,
-      …) are answered from the *recorded* ``control_response`` (id-remapped to the
-      live request), and inbound Direction-B control_requests
-      (``mcp_message``/``hook_callback``/``can_use_tool``) are dropped so no live
-      callback fires — replay stays inert. Control_responses are demuxed by the
-      SDK on ``request_id`` independent of conversation order, so the recorded
-      responses are answered as the SDK issues each request; no lockstep needed.
-      Ordering-sensitive control (``interrupt``) is a separate concern — see the
-      module docs / issue tracker.
+      …) are answered from the *recorded* ``control_response`` for that request's
+      ``subtype`` (id-remapped to the live request); inbound Direction-B
+      control_requests (``mcp_message``/``hook_callback``/``can_use_tool``) are
+      dropped so no live callback fires — replay stays inert.
+
+      Matching is by **subtype** (per-subtype FIFO), not arrival order: the SDK
+      demuxes responses by ``request_id`` (so the transport could hand back any
+      payload without the SDK noticing), which means *the transport itself* is
+      responsible for handing the right recorded response to the right request.
+      A live Direction-A request whose subtype has no remaining recorded response
+      is **fail-closed** — it raises :class:`CassetteMismatchError` rather than
+      synthesising success, because silently absorbing divergence is exactly the
+      drift a cassette exists to catch. Recorded responses for requests the live
+      SDK never issues are simply unused (not an error) — replay must not be
+      coupled to the *recording environment's* control sequence.
+
+      Ordering-sensitive control (``interrupt``), where a conversation frame must
+      land after a control exchange, needs lockstep interleaving and is out of
+      scope here — see the issue tracker.
     """
 
     def __init__(
         self,
         messages: list[RawMessage],
-        recorded_responses: Optional[list[RawMessage]] = None,
+        recorded_responses_by_subtype: Optional[dict[str, "deque[RawMessage]"]] = None,
     ) -> None:
         self._messages = messages
-        # Recorded Direction-A control_responses, in order. When present, each
-        # SDK control_request is answered from the next one (id-remapped) instead
-        # of a synthesised success. None -> legacy generic-success behaviour.
-        self._recorded_responses = recorded_responses
-        self._response_idx = 0
+        # Recorded Direction-A control_responses, keyed by the subtype of the
+        # request they answered (per-subtype FIFO). None -> legacy generic-success
+        # behaviour; a dict -> tape mode (subtype-matched, fail-closed).
+        self._responses_by_subtype = recorded_responses_by_subtype
         self._queue: asyncio.Queue[Any] = asyncio.Queue()
         self._ready = False
         self._streamed = False
         self._ended = False
         # Exposed for write-side assertions (e.g. that initialize was sent).
         self.writes: list[str] = []
+        # Observable for tests: the subtype of each Direction-A request answered.
+        self.answered_subtypes: list[Optional[str]] = []
 
     @classmethod
     def from_tape(cls, tape: list["TapeEntry"]) -> "ReplayTransport":
@@ -82,18 +107,39 @@ class ReplayTransport(Transport):
         - ``messages``: inbound conversation/system frames — every inbound frame
           that is neither a ``control_request`` (Direction B, dropped to stay
           inert) nor a ``control_response`` (answered separately, below).
-        - ``recorded_responses``: inbound ``control_response`` frames, in order —
-          the recorded answers to the SDK's Direction-A requests.
+        - ``recorded_responses_by_subtype``: the recorded ``control_response`` for
+          each Direction-A request, keyed by that request's ``subtype``. Built by
+          correlating each recorded SDK control_request (an outbound ``write``)
+          with its recorded ``control_response`` on the recorded ``request_id``.
         """
-        inbound = [e["frame"] for e in tape if e.get("dir") == "read"]
+        inbound = read_frames(tape)
         messages = [
             f for f in inbound
             if f.get("type") not in ("control_request", "control_response")
         ]
-        recorded_responses = [
-            f for f in inbound if f.get("type") == "control_response"
-        ]
-        return cls(messages, recorded_responses=recorded_responses)
+        # recorded control_responses, indexed by their recorded request_id
+        responses_by_recorded_id = {
+            (f.get("response") or {}).get("request_id"): f
+            for f in inbound
+            if f.get("type") == "control_response"
+        }
+        # join each recorded SDK control_request (write) to its response by id,
+        # bucketed by the request subtype (preserving order within a subtype)
+        by_subtype: dict[str, deque[RawMessage]] = defaultdict(deque)
+        for entry in tape:
+            if entry.get("dir") != "write":
+                continue
+            try:
+                req = json.loads(entry["data"])
+            except (TypeError, ValueError, KeyError):
+                continue
+            if req.get("type") != "control_request":
+                continue
+            subtype = (req.get("request") or {}).get("subtype")
+            resp = responses_by_recorded_id.get(req.get("request_id"))
+            if subtype is not None and resp is not None:
+                by_subtype[subtype].append(resp)
+        return cls(messages, recorded_responses_by_subtype=dict(by_subtype))
 
     async def connect(self) -> None:
         self._ready = True
@@ -111,30 +157,37 @@ class ReplayTransport(Transport):
             await self._answer_control_request(message)
 
     async def _answer_control_request(self, request: RawMessage) -> None:
-        # Answer for the live request id (unblocks the SDK, which demuxes the
-        # response by request_id), then stream the recorded conversation once.
+        # Answer for the live request id (the SDK demuxes the response by
+        # request_id), then stream the recorded conversation once.
         live_id = request.get("request_id")
-        await self._queue.put(self._response_for(live_id))
+        subtype = (request.get("request") or {}).get("subtype")
+        self.answered_subtypes.append(subtype)
+        await self._queue.put(self._response_for(subtype, live_id))
         if not self._streamed:
             self._streamed = True
             for raw in self._messages:
                 await self._queue.put(raw)
 
-    def _response_for(self, live_id: Optional[str]) -> RawMessage:
-        """The control_response to return for an SDK request id.
+    def _response_for(self, subtype: Optional[str], live_id: Optional[str]) -> RawMessage:
+        """The control_response to return for a live Direction-A request.
 
-        With a recorded tape, hand back the next recorded ``control_response``
-        (deep-copied, with its ``request_id`` remapped to the live one the SDK
-        minted this run); otherwise synthesise a generic success. Falls back to
-        generic success if the SDK issues more requests than were recorded.
+        Legacy mode (no tape) synthesises a generic success. Tape mode hands back
+        the next recorded response for this ``subtype`` (deep-copied so the stored
+        recording is never mutated, with ``request_id`` remapped to the live one);
+        if none remains, it is **fail-closed** — :class:`CassetteMismatchError`.
         """
-        if self._recorded_responses and self._response_idx < len(self._recorded_responses):
-            rec = json.loads(json.dumps(self._recorded_responses[self._response_idx]))
-            self._response_idx += 1
-            if isinstance(rec.get("response"), dict):
-                rec["response"]["request_id"] = live_id
-            return rec
-        return _control_response(live_id)
+        if self._responses_by_subtype is None:
+            return _control_response(live_id)
+        bucket = self._responses_by_subtype.get(subtype or "")
+        if not bucket:
+            raise CassetteMismatchError(
+                f"no recorded control_response for Direction-A request subtype "
+                f"{subtype!r}; the live control sequence diverged from the tape"
+            )
+        rec = copy.deepcopy(bucket.popleft())
+        if isinstance(rec.get("response"), dict):
+            rec["response"]["request_id"] = live_id
+        return rec
 
     async def read_messages(self):
         while True:
