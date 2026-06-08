@@ -51,6 +51,20 @@ def control_request_subtype(frame: RawMessage) -> str | None:
     return (frame.get("request") or {}).get("subtype")
 
 
+_CONTROL_FRAME_TYPES = ("control_request", "control_response")
+
+
+def message_frames(frames: list[RawMessage]) -> list[RawMessage]:
+    """The frames that should parse to typed messages — i.e. not control frames.
+
+    Control frames (``control_request``/``control_response``) ride the same stream
+    but are handled by the control protocol, not ``message_parser`` (which returns
+    ``None`` for them); excluding them keeps message-level consumers (replay,
+    drift) from treating control frames as conversation.
+    """
+    return [f for f in frames if f.get("type") not in _CONTROL_FRAME_TYPES]
+
+
 def replayable_messages(tape: list[TapeEntry]) -> list[RawMessage]:
     """Inbound conversation/system frames to feed the SDK's receive loop.
 
@@ -58,10 +72,7 @@ def replayable_messages(tape: list[TapeEntry]) -> list[RawMessage]:
     dropped so a consumer's registered callbacks stay inert on replay) nor a
     ``control_response`` (answered out-of-band, see ``control_responses_by_subtype``).
     """
-    return [
-        f for f in read_frames(tape)
-        if f.get("type") not in ("control_request", "control_response")
-    ]
+    return message_frames(read_frames(tape))
 
 
 def control_responses_by_subtype(tape: list[TapeEntry]) -> dict[str, deque[RawMessage]]:

@@ -17,10 +17,12 @@ from .tape import (
     conversation_messages,
     load_cassette,
     load_tape,
+    message_frames,
     read_frames,
     replayable_messages,
     serialize_tape,
 )
+from .drift import DriftFinding, check_tape, parse_drift
 from .transport import CassetteMismatchError, RecordingTransport, ReplayTransport
 
 __version__ = "0.2.0"
@@ -40,6 +42,10 @@ __all__ = [
     "read_frames",
     "conversation_messages",
     "replayable_messages",
+    "message_frames",
     "control_responses_by_subtype",
     "control_request_subtype",
+    "parse_drift",
+    "check_tape",
+    "DriftFinding",
 ]

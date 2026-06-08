@@ -85,6 +85,39 @@ handshake), so one recording can feed both conversation replay and
 control-protocol replay. Derive a conversation cassette with
 `conversation_messages(tape)`.
 
+## Drift detection (gate SDK bumps)
+
+Re-parse a cassette's message frames through the **installed** SDK's own
+`message_parser`. A frame that no longer parses — or whose content blocks the
+parser silently drops — is flagged. Because it reuses the SDK's own parser, there
+is no schema to maintain: the judge is the thing being judged.
+
+```bash
+claude-agent-cassette drift tests/cassettes/      # *.jsonl files, or dirs of them
+```
+
+```text
+drift: 5 cassette(s) vs claude-agent-sdk 0.2.87
+
+  ok    happy_path.jsonl
+  DRIFT stop_midtask.jsonl — 1 frame(s):
+          frame[3] assistant: content_dropped — 1 of 2 content block(s) dropped on parse
+  ok    notification.jsonl
+
+5 checked, 1 drifted (1 frame) — re-record the drifted cassettes.
+```
+
+- Exits **non-zero on drift** — use it to gate an SDK-bump PR in CI.
+- **Fails closed**: if no cassette files are found it exits non-zero (a mispointed
+  path can't pass as a false green); pass `--allow-empty` to override.
+- Three drift signals: `parse_error` (the parser rejected the frame), `unrecognized_type`
+  (the message type is gone), `content_dropped` (a content block silently vanished).
+- **Scope**: catches *parse-level* drift (rejected/skipped frames) + dropped content
+  blocks. It does **not** catch additive *field-level* drift (a still-parsing frame
+  that gained a field) — see [ROADMAP.md](ROADMAP.md).
+
+In Python: `parse_drift(frames)` / `check_tape(tape)` → `list[DriftFinding]`.
+
 ## Examples
 
 [`examples/`](examples/) has a runnable, no-key demo:
@@ -110,6 +143,8 @@ see above.)
 | `record_sdk_wire()` | CM that wraps the SDK's transport to capture a query's wire |
 | `serialize_tape` / `load_tape` / `load_cassette` | tape & cassette I/O |
 | `read_frames(tape)` / `conversation_messages(tape)` | derive replay views from a tape |
+| `parse_drift(frames)` / `check_tape(tape)` | drift findings vs the installed SDK |
+| `claude-agent-cassette drift <path…>` | CLI drift gate (non-zero on drift / empty) |
 
 ## How it works (the non-obvious bits)
 
@@ -125,17 +160,19 @@ see above.)
 
 ## Compatibility
 
-Replay uses only the public `Transport` API. **Record reaches into
-`claude_agent_sdk._internal`** (the subprocess transport + control-protocol
-shape), so it is version-sensitive — this release targets `claude-agent-sdk
-0.2.x`. Pin your SDK and re-verify on bumps.
+Replay uses only the public `Transport` API. **Record and drift reach into
+`claude_agent_sdk._internal`** (the subprocess transport, control-protocol shape,
+and `message_parser`), so they are version-sensitive — this release targets
+`claude-agent-sdk 0.2.x`. Pin your SDK and re-verify on bumps. (Drift being
+version-sensitive is the point: it tells you *when* a bump broke a cassette.)
 
 ## Roadmap
 
-See [ROADMAP.md](ROADMAP.md). Next up: **control-protocol replay** (faithfully
-replaying the captured `can_use_tool`/`hook_callback`/`mcp_message`/`interrupt`
-frames), a pytest plugin with record-on-miss, drift detection, and a cassette
-redaction helper.
+See [ROADMAP.md](ROADMAP.md). Shipped: conversation replay, recording,
+**Direction-A control replay** (`ReplayTransport.from_tape`), and **drift
+detection**. Next up: faithful **Direction-B** control replay
+(`can_use_tool`/`hook_callback`/`mcp_message` stubbing) + `interrupt` lockstep, a
+pytest plugin with record-on-miss, field-level drift, and a redaction helper.
 
 ## License
 
