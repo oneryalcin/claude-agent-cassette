@@ -189,6 +189,24 @@ def direction_b_exchanges(tape: list[TapeEntry]) -> dict[str, deque[ControlExcha
     return dict(by_subtype)
 
 
+def direction_b_read_frames(tape: list[TapeEntry]) -> list[RawMessage]:
+    """Inbound frames to feed the SDK for a **Direction-B** replay.
+
+    Conversation/system frames PLUS the inbound Direction-B ``control_request``s
+    (``can_use_tool`` / ``hook_callback`` / ``mcp_message``) — kept so the SDK
+    receives them and invokes the (stubbed) callbacks. Only ``control_response``
+    frames are dropped: those are Direction-A answers the transport delivers
+    out-of-band (the handshake / control machinery), not through the message stream.
+
+    Contrast :func:`replayable_messages`, which drops **all** control frames for
+    inert, conversation-only replay (today's default ``from_tape`` behaviour). This
+    view is the opt-in Direction-B counterpart: pair it with stub callbacks built
+    from :func:`direction_b_exchanges` so the kept requests resolve to the recorded
+    decisions instead of running the consumer's live logic.
+    """
+    return [f for f in read_frames(tape) if f.get("type") != "control_response"]
+
+
 def conversation_messages(tape: list[TapeEntry]) -> list[RawMessage]:
     """The inbound frames a conversation replay needs.
 

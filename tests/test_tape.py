@@ -13,6 +13,7 @@ from claude_agent_cassette import (
     control_request_subtype,
     control_responses_by_subtype,
     direction_b_exchanges,
+    direction_b_read_frames,
     load_tape,
     replayable_messages,
 )
@@ -159,3 +160,37 @@ def test_direction_b_real_permission_fixture_has_both_decision_shapes():
 def test_direction_b_real_websearch_fixture_counts():
     by = direction_b_exchanges(load_tape(_WEBSEARCH))
     assert {k: len(v) for k, v in by.items()} == {"mcp_message": 20, "hook_callback": 3}
+
+
+# --- Direction-B read-view: keep inbound control_requests, drop only control_response ---
+
+
+def test_direction_b_read_frames_keeps_control_requests_drops_responses():
+    frames = direction_b_read_frames(_tape())
+    types = [f["type"] for f in frames]
+    assert "control_request" in types   # Direction-B request kept (SDK must receive it)
+    assert "control_response" not in types  # Direction-A answer delivered out-of-band
+    assert "assistant" in types and "result" in types  # conversation kept
+
+
+def test_direction_b_read_frames_vs_replayable_messages_differ_only_on_requests():
+    # The two views agree on conversation but disagree on control_requests: the
+    # Direction-B view keeps them, the inert view drops them.
+    b = direction_b_read_frames(_tape())
+    inert = replayable_messages(_tape())
+    assert [f["type"] for f in b if f["type"] == "control_request"]  # B keeps
+    assert not [f["type"] for f in inert if f["type"] == "control_request"]  # inert drops
+    # same conversation frames in both
+    conv = lambda fs: [f["type"] for f in fs if f["type"] not in ("control_request", "control_response")]
+    assert conv(b) == conv(inert)
+
+
+def test_direction_b_read_frames_on_real_websearch_keeps_23_requests():
+    frames = direction_b_read_frames(load_tape(_WEBSEARCH))
+    n_requests = sum(1 for f in frames if f.get("type") == "control_request")
+    n_responses = sum(1 for f in frames if f.get("type") == "control_response")
+    assert n_requests == 23 and n_responses == 0
+
+
+def test_direction_b_read_frames_empty_tape():
+    assert direction_b_read_frames([]) == []
