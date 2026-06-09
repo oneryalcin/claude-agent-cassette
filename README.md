@@ -110,6 +110,12 @@ drift: 5 cassette(s) vs claude-agent-sdk 0.2.87
 - Exits **non-zero on drift** — use it to gate an SDK-bump PR in CI.
 - **Fails closed**: if no cassette files are found it exits non-zero (a mispointed
   path can't pass as a false green); pass `--allow-empty` to override.
+- **Two cassette layouts** in a directory: *flat* (top-level `*.jsonl`) or *nested*
+  (`<name>/input.jsonl`, where each cassette is a dir holding the recording plus
+  sidecars). Nested is auto-detected; only `input.jsonl` is checked, so sibling
+  `expected.jsonl` / `meta.json` are ignored, and a drift row is named by the
+  cassette dir. Use `--input-name FILE` for a different recording filename. A dir
+  mixing both layouts is rejected (it can't silently check only half).
 - Three drift signals: `parse_error` (the parser rejected the frame), `unrecognized_type`
   (the message type is gone), `content_dropped` (a content block silently vanished).
 - **Scope**: catches *parse-level* drift (rejected/skipped frames) + dropped content

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "claude-agent-cassette"
-version = "0.2.0"
+dynamic = ["version"]  # single source of truth: __init__.__version__ (see [tool.hatch.version])
 description = "Record & replay the claude-agent-sdk wire for deterministic, offline tests."
 readme = "README.md"
 license = { text = "MIT" }
@@ -31,6 +31,9 @@ Homepage = "https://github.com/oneryalcin/claude-agent-cassette"
 
 [project.scripts]
 claude-agent-cassette = "claude_agent_cassette.cli:main"
+
+[tool.hatch.version]
+path = "src/claude_agent_cassette/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/claude_agent_cassette"]

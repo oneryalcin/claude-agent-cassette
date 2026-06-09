@@ -25,7 +25,7 @@ from .tape import (
 from .drift import DriftFinding, check_tape, parse_drift
 from .transport import CassetteMismatchError, RecordingTransport, ReplayTransport
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 __all__ = [
     "ReplayTransport",
