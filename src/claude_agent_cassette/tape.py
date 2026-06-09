@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 from collections import defaultdict, deque
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple
 
 from typing_extensions import NotRequired, TypedDict
 
@@ -49,6 +49,25 @@ def read_frames(tape: list[TapeEntry]) -> list[RawMessage]:
 def control_request_subtype(frame: RawMessage) -> str | None:
     """The subtype of a control_request frame (``initialize``, ``mcp_message``, …)."""
     return (frame.get("request") or {}).get("subtype")
+
+
+def _write_payload(entry: TapeEntry) -> RawMessage | None:
+    """The parsed JSON object of an outbound ``write`` entry, or None.
+
+    Outbound frames store the raw payload *string* the SDK wrote; control-protocol
+    code needs it back as a dict. Returns None for non-``write`` entries, non-string
+    or non-JSON ``data``, or a JSON value that isn't an object.
+    """
+    if entry.get("dir") != "write":
+        return None
+    data = entry.get("data")
+    if not isinstance(data, str):
+        return None
+    try:
+        payload = json.loads(data)
+    except ValueError:
+        return None
+    return payload if isinstance(payload, dict) else None
 
 
 _CONTROL_FRAME_TYPES = ("control_request", "control_response")
@@ -91,19 +110,82 @@ def control_responses_by_subtype(tape: list[TapeEntry]) -> dict[str, deque[RawMe
     }
     by_subtype: dict[str, deque[RawMessage]] = defaultdict(deque)
     for entry in tape:
-        data = entry.get("data")
-        if entry.get("dir") != "write" or not isinstance(data, str):
-            continue
-        try:
-            request = json.loads(data)
-        except ValueError:
-            continue
-        if request.get("type") != "control_request":
+        request = _write_payload(entry)
+        if request is None or request.get("type") != "control_request":
             continue
         subtype = control_request_subtype(request)
         response = response_by_id.get(request.get("request_id"))
         if subtype is not None and response is not None:
             by_subtype[subtype].append(response)
+    return dict(by_subtype)
+
+
+class ControlExchange(NamedTuple):
+    """One recorded Direction-B control exchange — the CLI's request and the SDK's answer.
+
+    Direction B is the mirror of Direction A: the **CLI sends a control_request to the
+    SDK** (``can_use_tool`` / ``hook_callback`` / ``mcp_message``), the SDK invokes the
+    consumer's registered callback, and writes the **decision** back. So in the tape an
+    inbound ``read`` request is paired with an outbound ``write`` response on the same
+    ``request_id``.
+    """
+
+    subtype: str  # the request subtype: can_use_tool / hook_callback / mcp_message
+    request: RawMessage  # the inbound control_request's ``request`` payload (tool_name, input, …)
+    decision: RawMessage  # the recorded answer — the control_response's inner ``response`` payload
+    succeeded: bool  # whether the recorded response envelope was ``success`` (vs ``error``)
+    request_id: str  # the CLI-minted id correlating request↔decision (unused for stub matching)
+
+
+def direction_b_exchanges(tape: list[TapeEntry]) -> dict[str, deque[ControlExchange]]:
+    """Recorded Direction-B exchanges, keyed by request subtype, in recorded order.
+
+    The mirror of :func:`control_responses_by_subtype`: there the SDK *sends* the
+    request (outbound write) and the CLI answers (inbound read); here the CLI sends
+    the request (inbound read) and the SDK answers (outbound write). Each inbound
+    ``control_request`` is paired with its outbound ``control_response`` by
+    ``request_id`` so a replay stub can hand back the recorded ``decision`` instead
+    of running the consumer's live callback. An inbound request with no recorded
+    response is dropped (mirrors the Direction-A helper's unmatched handling).
+
+    Matching note: the stub callbacks the SDK invokes never see ``request_id``
+    (e.g. ``can_use_tool`` gets ``(tool_name, input, context)``), so consumers
+    correlate by subtype + payload shape + order — which is why this is keyed by
+    subtype and preserves recorded order within each subtype.
+    """
+    response_by_id: dict[str, RawMessage] = {}
+    for entry in tape:
+        payload = _write_payload(entry)
+        if payload is None or payload.get("type") != "control_response":
+            continue
+        envelope = payload.get("response") or {}
+        rid = envelope.get("request_id")
+        if rid is not None:
+            response_by_id[rid] = envelope
+
+    by_subtype: dict[str, deque[ControlExchange]] = defaultdict(deque)
+    for entry in tape:
+        if entry.get("dir") != "read":
+            continue
+        frame = entry.get("frame") or {}
+        if frame.get("type") != "control_request":
+            continue
+        subtype = control_request_subtype(frame)
+        request_id = frame.get("request_id")
+        if subtype is None or request_id is None:
+            continue
+        envelope = response_by_id.get(request_id)
+        if envelope is None:
+            continue
+        by_subtype[subtype].append(
+            ControlExchange(
+                subtype=subtype,
+                request=frame.get("request") or {},
+                decision=envelope.get("response") or {},
+                succeeded=envelope.get("subtype") == "success",
+                request_id=request_id,
+            )
+        )
     return dict(by_subtype)
 
 

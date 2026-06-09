@@ -7,10 +7,13 @@ return values, not transport internals).
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 from claude_agent_cassette import (
     control_request_subtype,
     control_responses_by_subtype,
+    direction_b_exchanges,
+    load_tape,
     replayable_messages,
 )
 
@@ -73,3 +76,86 @@ def test_control_request_subtype_accessor():
     assert control_request_subtype({"request": {"subtype": "initialize"}}) == "initialize"
     assert control_request_subtype({}) is None
     assert control_request_subtype({"request": None}) is None
+
+
+# --- Direction-B exchanges: inbound control_request (CLI->SDK) paired with the
+# outbound control_response (SDK's decision). Mirror of control_responses_by_subtype. ---
+
+
+def _b_request(subtype: str, request_id: str, extra: dict | None = None) -> dict:
+    """An inbound (read) Direction-B control_request: CLI -> SDK."""
+    return {"dir": "read", "frame": {
+        "type": "control_request", "request_id": request_id,
+        "request": {"subtype": subtype, **(extra or {})}}}
+
+
+def _b_decision(request_id: str, decision: dict, envelope: str = "success") -> dict:
+    """An outbound (write) control_response carrying the SDK's decision."""
+    return {"dir": "write", "data": json.dumps({"type": "control_response", "response": {
+        "subtype": envelope, "request_id": request_id, "response": decision}})}
+
+
+def test_direction_b_pairs_request_with_decision_by_subtype():
+    tape = [
+        _b_request("can_use_tool", "b1", {"tool_name": "Write", "input": {"file_path": "x"}}),
+        _b_decision("b1", {"behavior": "allow", "updatedInput": {"file_path": "y"}}),
+    ]
+    by = direction_b_exchanges(tape)
+    assert set(by) == {"can_use_tool"}
+    ex = by["can_use_tool"][0]
+    assert ex.subtype == "can_use_tool"
+    assert ex.request["tool_name"] == "Write"
+    assert ex.decision == {"behavior": "allow", "updatedInput": {"file_path": "y"}}
+    assert ex.succeeded is True
+    assert ex.request_id == "b1"
+
+
+def test_direction_b_preserves_order_within_subtype():
+    tape = [
+        _b_request("can_use_tool", "b1"), _b_decision("b1", {"behavior": "allow"}),
+        _b_request("can_use_tool", "b2"), _b_decision("b2", {"behavior": "deny", "message": "no"}),
+    ]
+    bucket = direction_b_exchanges(tape)["can_use_tool"]
+    assert [e.decision.get("behavior") for e in bucket] == ["allow", "deny"]
+
+
+def test_direction_b_unmatched_request_is_dropped():
+    # inbound request with no recorded response -> can't stub it -> dropped
+    assert direction_b_exchanges([_b_request("can_use_tool", "b1")]) == {}
+
+
+def test_direction_b_error_envelope_marked_not_succeeded():
+    tape = [_b_request("hook_callback", "b1"), _b_decision("b1", {}, envelope="error")]
+    ex = direction_b_exchanges(tape)["hook_callback"][0]
+    assert ex.succeeded is False
+
+
+def test_direction_b_ignores_direction_a_exchanges():
+    # _tape() has Direction-A (initialize/mcp_status: outbound request + inbound
+    # response) and one Direction-B mcp_message read with NO outbound response.
+    # None should surface as a Direction-B exchange.
+    assert direction_b_exchanges(_tape()) == {}
+
+
+def test_direction_b_empty_tape():
+    assert direction_b_exchanges([]) == {}
+
+
+# --- Against the real recorded fixtures (decisions must survive intact) ---
+
+_PERMISSION = Path(__file__).parent.parent / "examples" / "cassettes" / "permission_session.jsonl"
+_WEBSEARCH = Path(__file__).parent / "fixtures" / "websearch_control_tape.jsonl"
+
+
+def test_direction_b_real_permission_fixture_has_both_decision_shapes():
+    by = direction_b_exchanges(load_tape(_PERMISSION))
+    assert set(by) == {"can_use_tool"}
+    allow, deny = by["can_use_tool"]
+    assert [allow.decision["behavior"], deny.decision["behavior"]] == ["allow", "deny"]
+    assert "updatedInput" in allow.decision        # the redirect decision survived the scrub
+    assert deny.decision.get("message")            # the deny reason survived the scrub
+
+
+def test_direction_b_real_websearch_fixture_counts():
+    by = direction_b_exchanges(load_tape(_WEBSEARCH))
+    assert {k: len(v) for k, v in by.items()} == {"mcp_message": 20, "hook_callback": 3}

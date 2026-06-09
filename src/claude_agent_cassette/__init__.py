@@ -9,12 +9,14 @@ bug that mocked tests can't.
 from .record import record_sdk_wire
 from .replay import replay
 from .tape import (
+    ControlExchange,
     Direction,
     RawMessage,
     TapeEntry,
     control_request_subtype,
     control_responses_by_subtype,
     conversation_messages,
+    direction_b_exchanges,
     load_cassette,
     load_tape,
     message_frames,
