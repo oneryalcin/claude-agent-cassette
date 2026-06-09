@@ -84,3 +84,78 @@ def test_no_command_errors():
     import pytest
     with pytest.raises(SystemExit):
         main([])
+
+
+# --- nested <name>/input.jsonl layout (issue #11) -------------------------------
+
+_CLEAN = {"type": "assistant", "session_id": "s",
+          "message": {"model": "m", "content": [{"type": "text", "text": "x"}]}}
+_DRIFTED = {"type": "assistant_RENAMED", "message": {}}
+
+
+def _nested_cassette(parent: Path, frame: dict, name: str = "input.jsonl") -> Path:
+    """A nested cassette dir: <parent>/<name> holding one raw frame."""
+    parent.mkdir(parents=True, exist_ok=True)
+    (parent / name).write_text(json.dumps(frame) + "\n")
+    return parent
+
+
+def test_nested_layout_clean_passes(capsys, tmp_path):
+    _nested_cassette(tmp_path / "des6250", _CLEAN)
+    assert main(["drift", str(tmp_path)]) == 0
+    assert "no drift" in capsys.readouterr().out
+
+
+def test_nested_layout_drift_detected(capsys, tmp_path):
+    _nested_cassette(tmp_path / "error_result", _DRIFTED)
+    rc = main(["drift", str(tmp_path)])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "unrecognized_type" in out
+
+
+def test_nested_sibling_expected_never_drift_checked(capsys, tmp_path):
+    """The break-test: a drifted expected.jsonl sidecar must NOT be checked —
+    only input.jsonl is a cassette (allowlist, not a denylist of names to skip)."""
+    cass = _nested_cassette(tmp_path / "des6250", _CLEAN)        # recording: clean
+    (cass / "expected.jsonl").write_text(json.dumps(_DRIFTED) + "\n")  # answer key: would drift
+    (cass / "meta.json").write_text("{}")
+    assert main(["drift", str(tmp_path)]) == 0                   # clean → sidecar ignored
+    assert "no drift" in capsys.readouterr().out
+
+
+def test_nested_drift_row_names_directory_not_input_file(capsys, tmp_path):
+    _nested_cassette(tmp_path / "des6250", _DRIFTED)
+    main(["drift", str(tmp_path)])
+    out = capsys.readouterr().out
+    assert "des6250" in out          # identified by cassette dir name
+    assert "input.jsonl" not in out  # not the ambiguous filename
+
+
+def test_mixed_layout_fails_closed(capsys, tmp_path):
+    """Flat *.jsonl + nested */input.jsonl in one dir is ambiguous; checking only
+    one set would silently drop the other's coverage. Must fail, not half-run."""
+    (tmp_path / "flat.jsonl").write_text(json.dumps(_CLEAN) + "\n")
+    _nested_cassette(tmp_path / "des6250", _CLEAN)
+    rc = main(["drift", str(tmp_path)])
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "ambiguous layout" in err
+
+
+def test_input_name_selects_custom_nested_file(capsys, tmp_path):
+    """--input-name selects nested-only mode with a custom recording filename."""
+    _nested_cassette(tmp_path / "des6250", _DRIFTED, name="wire.jsonl")
+    rc = main(["drift", str(tmp_path), "--input-name", "wire.jsonl"])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "unrecognized_type" in out
+
+
+def test_input_name_is_nested_only_no_flat_fallback(capsys, tmp_path):
+    """Explicit --input-name means nested intent: a top-level *.jsonl is not a
+    fallback, so a dir with only flat tapes matches nothing and fails closed."""
+    (tmp_path / "flat.jsonl").write_text(json.dumps(_DRIFTED) + "\n")
+    rc = main(["drift", str(tmp_path), "--input-name", "input.jsonl"])
+    assert rc == 2
+    assert "nothing checked" in capsys.readouterr().err

@@ -13,6 +13,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import NamedTuple, TextIO
 
 import claude_agent_sdk
 
@@ -20,16 +21,72 @@ from .drift import parse_drift
 from .tape import RawMessage, message_frames, replayable_messages
 
 
-def _collect_tapes(paths: list[str]) -> list[Path]:
-    """Tape files from the given paths: a directory contributes its ``*.jsonl``."""
-    files: list[Path] = []
+_DEFAULT_INPUT_NAME = "input.jsonl"
+
+# Exit codes (named so the gate's contract is explicit, not magic ints).
+EXIT_OK = 0       # checked, no drift
+EXIT_DRIFT = 1    # at least one cassette drifted
+EXIT_MISUSE = 2   # nothing checked / ambiguous layout — fail closed
+
+
+class Cassette(NamedTuple):
+    """A cassette selected for drift-checking."""
+
+    path: Path
+    label: str  # how it reads in a drift row: file path (flat) or dir name (nested)
+
+
+class MixedLayoutError(Exception):
+    """A directory holds both flat ``*.jsonl`` and nested ``*/input.jsonl`` cassettes.
+
+    The layout is ambiguous, and silently checking only one set would be silent
+    coverage loss — a false green on an SDK bump, the exact failure this gate
+    exists to prevent. Fail closed and make the caller pick a layout. The
+    exception carries its own human-readable message (single source of truth).
+    """
+
+    def __init__(self, directory: Path, nested_name: str) -> None:
+        super().__init__(
+            f"{directory} holds both flat *.jsonl and nested */{nested_name} "
+            "cassettes — ambiguous layout. Point at one layout, or pass "
+            "--input-name to select the nested recording file explicitly."
+        )
+
+
+def _collect_tapes(paths: list[str], input_name: str | None = None) -> list[Cassette]:
+    """:class:`Cassette` selections to drift-check, from files and directories.
+
+    A directory is expanded by layout:
+
+    - **flat** — top-level ``*.jsonl`` (label: the file path); or
+    - **nested** — ``*/<input_name>`` exactly one level down, where each cassette
+      is a directory holding the recording plus sidecars (label: the cassette dir
+      name, so a drift row reads ``des6250`` rather than ``input.jsonl``).
+
+    Only ``<input_name>`` is ever treated as a cassette — sidecars such as
+    ``expected.jsonl`` / ``meta.json`` are ignored **by construction** (allowlist,
+    not a denylist of names to skip). Auto-detect (``input_name is None``) blesses
+    ``input.jsonl`` as the nested name; a directory that holds *both* layouts is a
+    :class:`MixedLayoutError` (never a silent partial run). Passing ``input_name``
+    explicitly selects nested-only mode (no flat globbing).
+    """
+    explicit = input_name is not None
+    nested_name = input_name or _DEFAULT_INPUT_NAME
+    tapes: list[Cassette] = []
     for raw in paths:
         path = Path(raw)
-        if path.is_dir():
-            files.extend(sorted(path.glob("*.jsonl")))
+        if not path.is_dir():
+            tapes.append(Cassette(path, str(path)))
+            continue
+        nested = sorted(path.glob(f"*/{nested_name}"))
+        flat = [] if explicit else sorted(path.glob("*.jsonl"))
+        if flat and nested:
+            raise MixedLayoutError(path, nested_name)
+        if nested:
+            tapes.extend(Cassette(p, p.parent.name) for p in nested)
         else:
-            files.append(path)
-    return files
+            tapes.extend(Cassette(p, str(p)) for p in flat)
+    return tapes
 
 
 def _load_frames(path: Path) -> list[RawMessage]:
@@ -43,9 +100,18 @@ def _load_frames(path: Path) -> list[RawMessage]:
     return message_frames(entries)  # raw inbound-frame cassette
 
 
-def _drift(paths: list[str], out, allow_empty: bool = False) -> int:
+def _drift(
+    paths: list[str], out: TextIO,
+    allow_empty: bool = False, input_name: str | None = None,
+) -> int:
     sdk_version = getattr(claude_agent_sdk, "__version__", "?")
-    tapes = _collect_tapes(paths)
+    try:
+        tapes = _collect_tapes(paths, input_name)
+    except MixedLayoutError as e:
+        # Fail closed on an ambiguous layout: checking only one set would silently
+        # drop the other's coverage (a false green). Make the caller disambiguate.
+        print(f"drift: {e}", file=sys.stderr)
+        return EXIT_MISUSE
     if not tapes and not allow_empty:
         # Fail closed: a gate that checked nothing must not report success — an
         # empty/mispointed path would otherwise be a false green on an SDK bump.
@@ -55,30 +121,31 @@ def _drift(paths: list[str], out, allow_empty: bool = False) -> int:
             "pass --allow-empty to treat this as success)",
             file=sys.stderr,
         )
-        return 2
+        return EXIT_MISUSE
     print(f"drift: {len(tapes)} cassette(s) vs claude-agent-sdk {sdk_version}\n", file=out)
 
     drifted_frames = 0
     drifted_tapes = 0
-    for tape_path in tapes:
-        findings = parse_drift(_load_frames(tape_path))
+    for cassette in tapes:
+        findings = parse_drift(_load_frames(cassette.path))
         if not findings:
-            print(f"  ok    {tape_path}", file=out)
+            print(f"  ok    {cassette.label}", file=out)
             continue
         drifted_tapes += 1
         drifted_frames += len(findings)
-        print(f"  DRIFT {tape_path} — {len(findings)} frame(s):", file=out)
+        print(f"  DRIFT {cassette.label} — {len(findings)} frame(s):", file=out)
         for f in findings:
             print(f"          frame[{f.frame_index}] {f.frame_type}: {f.reason} — {f.detail}", file=out)
 
-    print(
-        f"\n{len(tapes)} checked, {drifted_tapes} drifted "
-        f"({drifted_frames} frame(s)) — re-record the drifted cassettes."
-        if drifted_frames
-        else f"\n{len(tapes)} checked, no drift.",
-        file=out,
-    )
-    return 1 if drifted_frames else 0
+    if drifted_frames:
+        print(
+            f"\n{len(tapes)} checked, {drifted_tapes} drifted "
+            f"({drifted_frames} frame(s)) — re-record the drifted cassettes.",
+            file=out,
+        )
+        return EXIT_DRIFT
+    print(f"\n{len(tapes)} checked, no drift.", file=out)
+    return EXIT_OK
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -90,9 +157,18 @@ def main(argv: list[str] | None = None) -> int:
         "--allow-empty", action="store_true",
         help="exit 0 instead of failing when no cassette files are found",
     )
+    drift.add_argument(
+        "--input-name", default=None, metavar="FILE",
+        help="nested-layout cassette suites: name the recording file inside each "
+             "cassette dir (default auto-detect '*/input.jsonl' when a dir has no "
+             "top-level *.jsonl); passing it selects nested-only mode",
+    )
     args = parser.parse_args(argv)
     if args.command == "drift":
-        return _drift(args.paths, sys.stdout, allow_empty=args.allow_empty)
+        return _drift(
+            args.paths, sys.stdout,
+            allow_empty=args.allow_empty, input_name=args.input_name,
+        )
     parser.error(f"unknown command {args.command!r}")  # pragma: no cover
 
 
