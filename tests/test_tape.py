@@ -12,6 +12,7 @@ from pathlib import Path
 from claude_agent_cassette import (
     control_request_subtype,
     control_responses_by_subtype,
+    conversation_messages,
     direction_b_exchanges,
     direction_b_read_frames,
     load_tape,
@@ -194,3 +195,12 @@ def test_direction_b_read_frames_on_real_websearch_keeps_23_requests():
 
 def test_direction_b_read_frames_empty_tape():
     assert direction_b_read_frames([]) == []
+
+
+def test_conversation_messages_is_conversation_only():
+    # regression: conversation_messages must drop ALL control frames (it once kept
+    # control_requests, contradicting its name) — it's a synonym of replayable_messages.
+    convo = conversation_messages(load_tape(_WEBSEARCH))
+    types = {f.get("type") for f in convo}
+    assert "control_request" not in types and "control_response" not in types
+    assert convo == replayable_messages(load_tape(_WEBSEARCH))

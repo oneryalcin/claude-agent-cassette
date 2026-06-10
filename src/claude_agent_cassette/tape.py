@@ -225,14 +225,19 @@ def direction_b_read_frames(
 
 
 def conversation_messages(tape: list[TapeEntry]) -> list[RawMessage]:
-    """The inbound frames a conversation replay needs.
+    """The conversation-only inbound view — derive a replay cassette from a duplex tape.
 
-    Inbound frames minus the ``control_response`` to the initialize handshake,
-    which :class:`~claude_agent_cassette.ReplayTransport` synthesises itself on
-    replay. Control-protocol frames (``control_request`` for mcp/hooks, etc.) are
-    retained in the full tape but not in this conversation view.
+    Conversation/system frames only; **every** control frame is dropped:
+    ``control_response`` (Direction-A answers, which the transport handles out-of-band)
+    and ``control_request`` (Direction B — kept here would fire a consumer's callbacks
+    on replay). A synonym of :func:`replayable_messages`, exposed as the public name for
+    turning a recorded tape into a conversation cassette.
+
+    (This previously kept ``control_request`` frames, contradicting both this contract
+    and its name. For a Direction-B replay that *keeps* them, use
+    :func:`direction_b_read_frames`.)
     """
-    return [f for f in read_frames(tape) if f.get("type") != "control_response"]
+    return replayable_messages(tape)
 
 
 def load_cassette(path: str | Path) -> list[RawMessage]:
