@@ -187,6 +187,17 @@ through a real `ClaudeSDKClient`. (That cassette is a small, illustrative
 hand-written sample with realistic wire shapes; real cassettes are *recorded* —
 see above.)
 
+The three recorder scripts each capture one Direction-B subtype as a
+decision-preserving, scrubbed fixture (they spend a small API call to re-record;
+the committed fixtures in [`examples/cassettes/`](examples/cassettes/) replay
+offline):
+
+- [`record_permission_session.py`](examples/record_permission_session.py) — `can_use_tool`
+  (allow, allow + `updatedInput` redirect, deny)
+- [`record_hooks_session.py`](examples/record_hooks_session.py) — `hook_callback` (PreToolUse)
+- [`record_mcp_session.py`](examples/record_mcp_session.py) — `mcp_message`
+  (in-process MCP calculator; one normal + one `is_error` tool result)
+
 ## API
 
 | | |
