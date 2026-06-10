@@ -7,11 +7,16 @@ from typing import AsyncIterator, Literal, Optional
 
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
 
-from .control_stubs import control_stub_options, verify_initialize_hook_ids
+from .control_stubs import (
+    control_stub_options,
+    control_verify_options,
+    verify_direction_b_decisions,
+    verify_initialize_hook_ids,
+)
 from .tape import RawMessage, TapeEntry
 from .transport import ReplayTransport
 
-ReplayMode = Literal["inert", "stub"]
+ReplayMode = Literal["inert", "stub", "verify"]
 
 
 @asynccontextmanager
@@ -67,16 +72,22 @@ async def replay_tape(
       ``hook_callback`` requests are delivered to the SDK and answered from the tape by
       auto-installed stubs that **replace** the corresponding callbacks in ``options``.
       Deterministic and inert: your live permission/hook logic does not run; this
-      certifies the recorded *wire*, not your policy. (A future ``"verify"`` mode will
-      run your real callbacks and assert they match the recording.)
+      certifies the recorded *wire*, not your policy.
+    - ``mode="verify"``: the recorded Direction-B requests are delivered to **your
+      real** ``can_use_tool`` / ``hooks`` from ``options`` (nothing is replaced), and
+      on exit each live decision is diffed against the recorded one — matched exactly
+      by ``request_id``, at the wire. This certifies that your policy still produces
+      the recorded decisions; a changed decision, a callback that now raises (or no
+      longer does), or an unanswered exchange is divergence.
 
-    **Fail-closed end-to-end.** In ``"stub"`` mode, divergence from the tape — a live
-    request with no recorded match, an exhausted or error-envelope decision, hook ids
-    the SDK didn't reproduce, or recorded exchanges left unreplayed — raises
+    **Fail-closed end-to-end.** In ``"stub"`` and ``"verify"`` modes, divergence from
+    the tape — a live request with no recorded match, an exhausted or error-envelope
+    decision, hook ids the SDK didn't reproduce, a live decision that differs from the
+    recording, or recorded exchanges left unreplayed — raises
     :class:`~claude_agent_cassette.CassetteMismatchError` when the ``async with`` block
-    exits cleanly. (The raise happens here, not inside the stub: the SDK swallows
+    exits cleanly. (The raise happens here, not inside the callback: the SDK swallows
     callback exceptions into error responses, so the divergence is collected and
-    surfaced on exit.) A tape carrying a Direction-B subtype with no stub builder yet
+    surfaced on exit.) A tape carrying a Direction-B subtype with no replay support yet
     (``mcp_message``) raises up front — use ``mode="inert"`` for it.
 
     As with :func:`replay`, break at the terminal ``ResultMessage``; the stream stays
@@ -89,19 +100,25 @@ async def replay_tape(
                 if type(message).__name__ == "ResultMessage":
                     break
     """
-    if mode == "stub":
-        bundle = control_stub_options(tape, options)
+    if mode in ("stub", "verify"):
+        build = control_stub_options if mode == "stub" else control_verify_options
+        bundle = build(tape, options)
         transport = ReplayTransport.from_tape(tape, keep_control_requests=bundle.keep_subtypes)
         client = ClaudeSDKClient(options=bundle.options, transport=transport)
         await client.connect()
         if "hook_callback" in bundle.keep_subtypes:
             # The live initialize is now on the wire; confirm the SDK reproduced the
-            # recorded hook ids (else the stubs won't be invoked).
+            # recorded hook ids (else the recorded requests won't route to the
+            # replay's hooks).
             verify_initialize_hook_ids(transport.writes, tape, bundle.ledger)
         try:
             yield client
         finally:
             await client.disconnect()
+        if mode == "verify":
+            # All answers the consumer's real callbacks produced are now in
+            # transport.writes — diff them against the recording.
+            verify_direction_b_decisions(transport.writes, tape, bundle.ledger)
         # Only on clean exit (a consumer error propagates through the finally above and
         # skips this) — surface any divergence the SDK swallowed during replay.
         bundle.ledger.raise_if_diverged()

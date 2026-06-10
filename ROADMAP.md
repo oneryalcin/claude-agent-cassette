@@ -23,11 +23,16 @@ Directional, not a promise. Issues/PRs welcome on any of these.
 - **Direction B** (CLI→SDK: `can_use_tool`, `hook_callback`, `mcp_message`) — **stub
   replay shipped** for `can_use_tool` + `hook_callback` (`replay_tape(mode="stub")`):
   the recorded requests are delivered and answered from the tape by stubs, fail-closed
-  end-to-end on divergence. Remaining:
+  end-to-end on divergence.
+- **`verify` mode** — **shipped** (`replay_tape(mode="verify")`): the consumer's *real*
+  `can_use_tool` / `hooks` answer the recorded requests, and each live decision is
+  diffed against the recording at the wire, matched by `request_id` (tests the policy,
+  not just the wire). Fail-closed on a changed decision, a callback that now raises,
+  or an unanswered exchange. Remaining:
   - **`mcp_message`** stubbing — synthesize an in-process MCP server from the recorded
-    `initialize` / `tools/list` / `tools/call` results.
-  - **`verify` mode** — run the consumer's *real* callbacks and assert their decisions
-    match the recording (tests the policy, not just the wire). The `mode` enum has room.
+    `initialize` / `tools/list` / `tools/call` results. (For verify mode, the recorded
+    MCP payloads embed environment-dependent bits — e.g. `serverInfo` versions — so the
+    diff needs more than dict equality; study with a real recording.)
   - **`interrupt` lockstep** — ordering-sensitive Direction-A control where a conversation
     frame must land after a control exchange.
 

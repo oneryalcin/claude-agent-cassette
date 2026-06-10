@@ -30,7 +30,9 @@ from .control_stubs import (
     ControlReplayLedger,
     ControlStubBundle,
     control_stub_options,
+    control_verify_options,
     direction_b_replay_findings,
+    verify_direction_b_decisions,
 )
 from .redact import scrub_tape
 from .drift import DriftFinding, check_tape, parse_drift
@@ -61,6 +63,8 @@ __all__ = [
     "ControlExchange",
     "recorded_hook_config",
     "control_stub_options",
+    "control_verify_options",
+    "verify_direction_b_decisions",
     "ControlStubBundle",
     "ControlReplayLedger",
     "direction_b_replay_findings",
