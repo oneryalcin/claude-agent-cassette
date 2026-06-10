@@ -143,12 +143,17 @@ def _summary(scrubbed: list[dict]) -> None:
 
 
 async def main() -> None:
+    # Isolate the CLI from the operator's ~/.claude: a fresh config dir means the
+    # recorded system/init inventory (slash commands, plugins, skills, MCP servers,
+    # hooks) is the CLI's builtin baseline, not this machine's fingerprint.
+    config_dir = tempfile.mkdtemp(prefix="cassette-clean-config-")
     with tempfile.TemporaryDirectory() as cwd:
         options = ClaudeAgentOptions(
             can_use_tool=deterministic_permission,
             permission_mode="default",  # ensures the callback is consulted
             cwd=cwd,
             model=_MODEL,
+            env={"CLAUDE_CONFIG_DIR": config_dir},
         )
         print(f"Recording permission session in {cwd} ...\n")
         with record() as tape:

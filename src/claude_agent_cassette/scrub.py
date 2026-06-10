@@ -63,3 +63,53 @@ def scrub_tape(tape: list[TapeEntry], replacements: Replacements) -> list[TapeEn
         else:
             scrubbed.append(_scrub_values(entry, ordered))
     return scrubbed
+
+
+# The system/init keys that list the recording environment's inventory. Names of
+# slash commands, plugins, skills, agents, MCP servers, memory files, and tools
+# fingerprint the operator's machine (or a company's internal tooling) — and for
+# replay they are inert: the SDK keeps the init frame wholesale as
+# SystemMessage.data without reading them, so blanking is decision-preserving by
+# construction.
+_INIT_INVENTORY_KEYS = (
+    "slash_commands",
+    "plugins",
+    "skills",
+    "agents",
+    "mcp_servers",
+    "memory_paths",
+    "tools",
+)
+
+
+def scrub_init_inventory(tape: list[TapeEntry]) -> list[TapeEntry]:
+    """A copy of ``tape`` with the environment inventory in ``system/init`` frames blanked.
+
+    The CLI's ``system/init`` frame enumerates the recording environment — every
+    slash command, plugin (with cache paths), skill, agent, connected MCP server,
+    memory path, and tool name. :func:`scrub_tape` masks *values* you name; this
+    blanks those inventory **lists** to ``[]`` wholesale, for tapes recorded in
+    real environments where the inventory itself is the leak.
+
+    Keys are blanked only where present and list-valued (structure and types are
+    preserved; nothing is dropped or reshaped). The best fix is recording in an
+    isolated environment in the first place (``env={"CLAUDE_CONFIG_DIR": ...}`` —
+    see ``examples/record_stop_session.py``); this is the after-the-fact repair.
+    """
+    scrubbed: list[TapeEntry] = []
+    for entry in tape:
+        frame = entry.get("frame")
+        if (
+            entry.get("dir") == "read"
+            and isinstance(frame, dict)
+            and frame.get("type") == "system"
+            and frame.get("subtype") == "init"
+        ):
+            blanked = {
+                k: ([] if k in _INIT_INVENTORY_KEYS and isinstance(v, list) else v)
+                for k, v in frame.items()
+            }
+            scrubbed.append({"dir": "read", "frame": blanked})
+        else:
+            scrubbed.append(entry)
+    return scrubbed

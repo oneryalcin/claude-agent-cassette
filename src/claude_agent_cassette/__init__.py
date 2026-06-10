@@ -27,7 +27,7 @@ from .tape import (
     save_tape,
 )
 from .direction_b import lint_tape
-from .scrub import Replacements, scrub_tape
+from .scrub import Replacements, scrub_init_inventory, scrub_tape
 from .drift import (
     DriftFinding,
     DriftReason,
@@ -62,6 +62,7 @@ __all__ = [
     "direction_b_exchanges",
     "ControlExchange",
     "scrub_tape",
+    "scrub_init_inventory",
     "Replacements",
     # tape health: drift (does the installed SDK still parse it?) and
     # replayability (is it still Direction-B replayable after a scrub?)

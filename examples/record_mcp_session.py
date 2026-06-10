@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -110,11 +111,16 @@ async def main() -> None:
     calculator = create_sdk_mcp_server(
         name="calculator", version="1.0.0", tools=[add_numbers, divide_numbers]
     )
+    # Isolate the CLI from the operator's ~/.claude: a fresh config dir means the
+    # recorded system/init inventory (slash commands, plugins, skills, MCP servers,
+    # hooks) is the CLI's builtin baseline, not this machine's fingerprint.
+    config_dir = tempfile.mkdtemp(prefix="cassette-clean-config-")
     options = ClaudeAgentOptions(
         mcp_servers={"calc": calculator},
         # Pre-approve the tools so the tape stays mcp_message-only (no can_use_tool).
         allowed_tools=["mcp__calc__add", "mcp__calc__divide"],
         model=_MODEL,
+        env={"CLAUDE_CONFIG_DIR": config_dir},
     )
     print("Recording mcp session ...\n")
     with record() as tape:
