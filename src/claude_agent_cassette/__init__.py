@@ -25,6 +25,7 @@ from .tape import (
     replayable_messages,
     serialize_tape,
 )
+from .control_stubs import build_permission_stub
 from .drift import DriftFinding, check_tape, parse_drift
 from .transport import CassetteMismatchError, RecordingTransport, ReplayTransport
 
@@ -51,6 +52,7 @@ __all__ = [
     "direction_b_exchanges",
     "direction_b_read_frames",
     "ControlExchange",
+    "build_permission_stub",
     "parse_drift",
     "check_tape",
     "DriftFinding",
