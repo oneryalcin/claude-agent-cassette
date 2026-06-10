@@ -1,14 +1,19 @@
-"""Direction-B ``can_use_tool`` stub — replay recorded permission decisions (piece 3).
+"""Direction-B replay: stub callbacks + end-to-end fail-closed enforcement.
 
-Unit tests drive the stub directly; the integration test installs it in a real
-``ClaudeSDKClient`` over a read-view that keeps the recorded ``can_use_tool``
-requests (``direction_b_read_frames``), so the SDK's real control machinery invokes
-the stub and the recorded decisions flow back — proving the mechanism end to end
-without yet needing the ``from_tape`` Direction-B wiring (piece 4).
+Two layers of tests, because divergence has to be caught in two places:
+
+- **Unit** tests drive the stubs directly — they raise ``CassetteMismatchError`` on
+  divergence (the direct-call fail-closed path).
+- **End-to-end** tests drive divergence through ``replay_tape(mode="stub")`` over a real
+  ``ClaudeSDKClient``. This is the path that matters: the SDK swallows a stub's exception
+  into a benign error response, so the *only* way divergence surfaces to a consumer is the
+  ledger check on context exit. The original implementation passed every unit test while
+  being fail-**open** end-to-end; these tests pin the real guarantee.
 """
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 from pathlib import Path
 
@@ -22,130 +27,125 @@ from claude_agent_sdk import (
 
 from claude_agent_cassette import (
     CassetteMismatchError,
+    ControlReplayLedger,
     ReplayTransport,
-    build_hook_stubs,
-    build_permission_stub,
     control_stub_options,
     direction_b_exchanges,
-    direction_b_read_frames,
     load_tape,
     recorded_hook_config,
     replay_tape,
 )
+from claude_agent_cassette.control_stubs import build_permission_stub, build_hook_stubs
 
 _PERMISSION = Path(__file__).parent.parent / "examples" / "cassettes" / "permission_session.jsonl"
 _HOOKS = Path(__file__).parent.parent / "examples" / "cassettes" / "hooks_session.jsonl"
 _WEBSEARCH = Path(__file__).parent / "fixtures" / "websearch_control_tape.jsonl"
 _TIMEOUT_S = 20
-
-# The stub never reads the permission context, so a placeholder is fine here.
-_CTX = None
+_CTX = None  # the stubs never read the permission/hook context
 
 
-def _tape():
+def _perm():
     return load_tape(_PERMISSION)
 
 
-def _exchanges():
-    return direction_b_exchanges(_tape())["can_use_tool"]
+def _hooks():
+    return load_tape(_HOOKS)
 
 
-# --- Unit: the stub reconstructs the recorded decision for a matching request ---
+def _perm_exchanges():
+    return direction_b_exchanges(_perm())["can_use_tool"]
 
 
-async def test_stub_replays_recorded_allow_with_updated_input():
-    allow_ex, _deny = _exchanges()
-    stub = build_permission_stub(_tape())
+async def _drive(tape, mode="stub", options=None):
+    """Replay to the terminal ResultMessage; raises if replay_tape surfaces divergence."""
+    async with replay_tape(tape, options=options, mode=mode) as client:
+        async for message in client.receive_messages():
+            if type(message).__name__ == "ResultMessage":
+                break
+
+
+# --- Unit: stubs reconstruct the recorded decision; raise (directly) on divergence ---
+
+
+async def test_permission_stub_replays_allow_with_updated_input():
+    allow_ex, _deny = _perm_exchanges()
+    stub = build_permission_stub(_perm(), ControlReplayLedger())
     result = await stub(allow_ex.request["tool_name"], allow_ex.request["input"], _CTX)
     assert isinstance(result, PermissionResultAllow)
     assert result.updated_input == allow_ex.decision["updatedInput"]
 
 
-async def test_stub_replays_recorded_deny_with_message():
-    _allow, deny_ex = _exchanges()
-    stub = build_permission_stub(_tape())
+async def test_permission_stub_replays_deny_with_message():
+    _allow, deny_ex = _perm_exchanges()
+    stub = build_permission_stub(_perm(), ControlReplayLedger())
     result = await stub(deny_ex.request["tool_name"], deny_ex.request["input"], _CTX)
     assert isinstance(result, PermissionResultDeny)
     assert result.message == deny_ex.decision["message"]
 
 
-# --- Fail-closed: never invent or reuse a decision ---
-
-
-async def test_stub_fails_closed_on_unrecorded_request():
-    stub = build_permission_stub(_tape())
+async def test_permission_stub_raises_and_records_on_unrecorded_request():
+    ledger = ControlReplayLedger()
+    stub = build_permission_stub(_perm(), ledger)
     with pytest.raises(CassetteMismatchError):
         await stub("Bash", {"command": "echo never recorded"}, _CTX)
+    assert ledger.diverged()  # also recorded for the swallowed end-to-end path
 
 
-async def test_stub_fails_closed_when_decisions_exhausted():
-    exchanges = _exchanges()
-    stub = build_permission_stub(_tape())
-    for ex in exchanges:  # consume every recorded decision
+async def test_permission_stub_raises_when_exhausted():
+    exchanges = _perm_exchanges()
+    stub = build_permission_stub(_perm(), ControlReplayLedger())
+    for ex in exchanges:
         await stub(ex.request["tool_name"], ex.request["input"], _CTX)
-    # the same request again has nothing left -> divergence, not a silent re-use
     with pytest.raises(CassetteMismatchError):
         await stub(exchanges[0].request["tool_name"], exchanges[0].request["input"], _CTX)
 
 
-# --- Integration: the stub drives a real client to completion with recorded decisions ---
+async def test_hook_stub_replays_recorded_output():
+    hooks = build_hook_stubs(_hooks(), ControlReplayLedger())
+    assert list(hooks) == ["PreToolUse"]
+    output = await hooks["PreToolUse"][0].hooks[0]({}, None, {})
+    assert output["hookSpecificOutput"]["permissionDecision"] == "allow"
 
 
-async def test_stub_drives_real_client_end_to_end():
-    tape = _tape()
-    base = build_permission_stub(tape)
-    fired: list[tuple[str, str]] = []
-
-    async def spy(tool_name, tool_input, context):
-        result = await base(tool_name, tool_input, context)
-        fired.append((tool_name, type(result).__name__))
-        return result
-
-    async def drive():
-        client = ClaudeSDKClient(
-            options=ClaudeAgentOptions(can_use_tool=spy),
-            transport=ReplayTransport(direction_b_read_frames(tape)),
-        )
-        await client.connect()
-        types: list[str] = []
-        async for message in client.receive_messages():
-            types.append(type(message).__name__)
-            if type(message).__name__ == "ResultMessage":
-                break
-        await client.disconnect()
-        return types
-
-    types = await asyncio.wait_for(drive(), _TIMEOUT_S)
-    assert types[-1] == "ResultMessage"
-    # the recorded can_use_tool requests were answered, in order, from the tape
-    assert fired == [("Write", "PermissionResultAllow"), ("Write", "PermissionResultDeny")]
+async def test_hook_stub_raises_when_exhausted():
+    stub = build_hook_stubs(_hooks(), ControlReplayLedger())["PreToolUse"][0].hooks[0]
+    await stub({}, None, {})
+    with pytest.raises(CassetteMismatchError):
+        await stub({}, None, {})
 
 
-# --- Piece 4: control_stub_options + replay_tape wiring ---
+def test_build_hook_stubs_none_when_no_hooks():
+    assert build_hook_stubs(_perm(), ControlReplayLedger()) is None
 
 
-def test_control_stub_options_installs_permission_stub_without_mutating_base():
-    base = ClaudeAgentOptions(can_use_tool=None)
-    options, keep = control_stub_options(_tape(), base)
-    assert keep == {"can_use_tool"}
-    assert options.can_use_tool is not None       # stub installed on the copy
-    assert base.can_use_tool is None              # base untouched
-    assert options is not base
+def test_recorded_hook_config_reads_initialize_structure():
+    assert recorded_hook_config(_hooks()) == {
+        "PreToolUse": [{"matcher": "Bash", "hookCallbackIds": ["hook_0"]}]
+    }
 
 
-def test_control_stub_options_degrades_when_a_subtype_is_unreproducible():
-    # websearch has no can_use_tool and its hook ids are scrubbed (unreproducible) ->
-    # nothing is stubbed, hooks are left inert, and a warning makes the gap visible.
-    websearch = load_tape(_WEBSEARCH)
-    base = ClaudeAgentOptions()
-    with pytest.warns(UserWarning, match="hook_callback replay unavailable"):
-        options, keep = control_stub_options(websearch, base)
-    assert keep == set()
-    assert options.can_use_tool is base.can_use_tool  # left as-is
+# --- control_stub_options: bundle shape, non-mutation, fail-closed on unsupported ---
 
 
-def _permission_responses(writes: list[str]) -> list[dict]:
-    """The permission decisions the SDK wrote back (control_responses carrying behavior)."""
+def test_control_stub_options_installs_stub_and_clears_prompt_tool_name():
+    base = ClaudeAgentOptions(can_use_tool=None, permission_prompt_tool_name="x")
+    bundle = control_stub_options(_perm(), base)
+    assert bundle.keep_subtypes == {"can_use_tool"}
+    assert bundle.options.can_use_tool is not None  # stub installed on the copy
+    assert bundle.options.permission_prompt_tool_name is None  # cleared (SDK-incompatible)
+    assert base.can_use_tool is None and base.permission_prompt_tool_name == "x"  # base untouched
+
+
+def test_control_stub_options_fails_closed_on_unsupported_subtype():
+    # websearch carries mcp_message, which has no stub builder yet -> raise, not silent.
+    with pytest.raises(CassetteMismatchError, match="mcp_message"):
+        control_stub_options(_WEBSEARCH and load_tape(_WEBSEARCH))
+
+
+# --- Behavioral: stub mode delivers the requests (SDK writes decisions); inert drops them ---
+
+
+def _written_decisions(writes, key):
     out = []
     for data in writes:
         try:
@@ -154,12 +154,13 @@ def _permission_responses(writes: list[str]) -> list[dict]:
             continue
         if frame.get("type") == "control_response":
             decision = (frame.get("response") or {}).get("response") or {}
-            if "behavior" in decision:
+            if key in decision:
                 out.append(decision)
     return out
 
 
-async def _drive_to_result(client: ClaudeSDKClient) -> None:
+async def _drive_transport(options, transport):
+    client = ClaudeSDKClient(options=options, transport=transport)
     await client.connect()
     async for message in client.receive_messages():
         if type(message).__name__ == "ResultMessage":
@@ -167,133 +168,127 @@ async def _drive_to_result(client: ClaudeSDKClient) -> None:
     await client.disconnect()
 
 
-async def test_direction_b_mode_delivers_requests_inert_mode_drops_them():
-    """The behavioral difference: in Direction-B mode the SDK receives the recorded
-    can_use_tool requests and the stub answers them (so the SDK writes control_responses
-    carrying the decision); inert mode drops the requests, so no such writes occur."""
-    tape = _tape()
+async def test_stub_mode_delivers_permission_requests_inert_drops_them():
+    tape = _perm()
+    bundle = control_stub_options(tape)
+    transport = ReplayTransport.from_tape(tape, keep_control_requests=bundle.keep_subtypes)
+    await asyncio.wait_for(_drive_transport(bundle.options, transport), _TIMEOUT_S)
+    assert [d["behavior"] for d in _written_decisions(transport.writes, "behavior")] == ["allow", "deny"]
 
-    options, keep = control_stub_options(tape)
-    transport = ReplayTransport.from_tape(tape, keep_control_requests=keep)
-    await asyncio.wait_for(_drive_to_result(ClaudeSDKClient(options=options, transport=transport)), _TIMEOUT_S)
-    assert [d["behavior"] for d in _permission_responses(transport.writes)] == ["allow", "deny"]
-
-    inert = ReplayTransport.from_tape(tape)  # default: Direction-B dropped
-    await asyncio.wait_for(_drive_to_result(ClaudeSDKClient(options=ClaudeAgentOptions(), transport=inert)), _TIMEOUT_S)
-    assert _permission_responses(inert.writes) == []
+    inert = ReplayTransport.from_tape(tape)
+    await asyncio.wait_for(_drive_transport(ClaudeAgentOptions(), inert), _TIMEOUT_S)
+    assert _written_decisions(inert.writes, "behavior") == []
 
 
-async def test_replay_tape_control_true_replays_to_result():
-    async def drive():
-        async with replay_tape(_tape(), control=True) as client:
-            types = []
-            async for message in client.receive_messages():
-                types.append(type(message).__name__)
-                if types[-1] == "ResultMessage":
-                    break
-            return types
-    types = await asyncio.wait_for(drive(), _TIMEOUT_S)
-    assert types[-1] == "ResultMessage"
+async def test_stub_mode_delivers_hook_requests_inert_drops_them():
+    tape = _hooks()
+    bundle = control_stub_options(tape)
+    assert bundle.keep_subtypes == {"hook_callback"}
+    transport = ReplayTransport.from_tape(tape, keep_control_requests=bundle.keep_subtypes)
+    await asyncio.wait_for(_drive_transport(bundle.options, transport), _TIMEOUT_S)
+    answered = _written_decisions(transport.writes, "hookSpecificOutput")
+    assert len(answered) == 1 and answered[0]["hookSpecificOutput"]["permissionDecision"] == "allow"
+
+    inert = ReplayTransport.from_tape(tape)
+    await asyncio.wait_for(_drive_transport(ClaudeAgentOptions(), inert), _TIMEOUT_S)
+    assert _written_decisions(inert.writes, "hookSpecificOutput") == []
 
 
-async def test_replay_tape_control_false_leaves_consumer_callback_inert():
+# --- End-to-end through replay_tape: clean completes, divergence RAISES, inert is inert ---
+
+
+async def test_replay_tape_stub_mode_clean_completes_without_false_divergence():
+    await asyncio.wait_for(_drive(_perm(), "stub"), _TIMEOUT_S)
+    await asyncio.wait_for(_drive(_hooks(), "stub"), _TIMEOUT_S)
+
+
+async def test_replay_tape_inert_mode_leaves_consumer_callback_unused():
     fired: list[str] = []
 
     async def consumer(tool_name, tool_input, context):
         fired.append(tool_name)
         return PermissionResultAllow()
 
-    async def drive():
-        async with replay_tape(
-            _tape(), options=ClaudeAgentOptions(can_use_tool=consumer), control=False
-        ) as client:
-            async for message in client.receive_messages():
-                if type(message).__name__ == "ResultMessage":
-                    break
-
-    await asyncio.wait_for(drive(), _TIMEOUT_S)
-    assert fired == []  # Direction-B dropped -> the consumer's callback is never consulted
+    await asyncio.wait_for(
+        _drive(_perm(), "inert", options=ClaudeAgentOptions(can_use_tool=consumer)), _TIMEOUT_S
+    )
+    assert fired == []  # Direction-B dropped -> consumer callback never consulted
 
 
-# --- hook_callback stub ---
+def _inject_unmatched_permission(tape):
+    """Add a can_use_tool request with a fresh id and no recorded response (divergence)."""
+    extra = {"dir": "read", "frame": {
+        "type": "control_request", "request_id": "INJECTED",
+        "request": {"subtype": "can_use_tool", "tool_name": "Bash", "input": {"command": "x"}}}}
+    out = copy.deepcopy(tape)
+    for i, entry in enumerate(out):
+        frame = entry.get("frame") if entry.get("dir") == "read" else None
+        if frame and frame.get("type") == "control_request" \
+                and frame["request"].get("subtype") == "can_use_tool":
+            out.insert(i, extra)
+            return out
+    raise AssertionError("no can_use_tool request to anchor injection")
 
 
-def test_recorded_hook_config_reads_initialize_structure():
-    assert recorded_hook_config(load_tape(_HOOKS)) == {
-        "PreToolUse": [{"matcher": "Bash", "hookCallbackIds": ["hook_0"]}]
-    }
+async def test_replay_tape_stub_mode_raises_on_unmatched_request_end_to_end():
+    """The regression test for the original fail-open bug: a live can_use_tool request
+    with no recorded decision must surface as CassetteMismatchError through replay_tape,
+    even though the SDK swallows the stub's raise into an error response."""
+    diverged = _inject_unmatched_permission(_perm())
+    with pytest.raises(CassetteMismatchError, match="Bash"):
+        await asyncio.wait_for(_drive(diverged, "stub"), _TIMEOUT_S)
 
 
-def test_recorded_hook_config_none_when_no_hooks():
-    # the permission session registered no hooks
-    assert recorded_hook_config(load_tape(_PERMISSION)) is None
-
-
-async def test_build_hook_stubs_replays_recorded_output():
-    hooks = build_hook_stubs(load_tape(_HOOKS))
-    assert list(hooks) == ["PreToolUse"]
-    stub = hooks["PreToolUse"][0].hooks[0]
-    output = await stub({}, None, {})
-    assert output["hookSpecificOutput"]["permissionDecision"] == "allow"
-
-
-async def test_build_hook_stubs_fail_closed_when_exhausted():
-    stub = build_hook_stubs(load_tape(_HOOKS))["PreToolUse"][0].hooks[0]
-    await stub({}, None, {})  # consume the one recorded output
-    with pytest.raises(CassetteMismatchError):
-        await stub({}, None, {})
-
-
-def test_build_hook_stubs_fail_closed_on_unreproducible_ids():
-    # websearch fixture scrubbed its hookCallbackIds to "<scrubbed>", so the SDK's
-    # hook_0/hook_1/... assignment can't be reproduced -> fail closed, never mis-route
-    with pytest.raises(CassetteMismatchError):
-        build_hook_stubs(load_tape(_WEBSEARCH))
-
-
-def test_build_hook_stubs_none_when_no_hooks():
-    assert build_hook_stubs(load_tape(_PERMISSION)) is None
-
-
-def _hook_responses(writes: list[str]) -> list[dict]:
-    """The hook outputs the SDK wrote back (control_responses carrying hookSpecificOutput)."""
-    out = []
-    for data in writes:
-        try:
-            frame = json.loads(data)
-        except ValueError:
-            continue
-        if frame.get("type") == "control_response":
-            decision = (frame.get("response") or {}).get("response") or {}
-            if "hookSpecificOutput" in decision:
-                out.append(decision)
+def _make_hook_error_envelope(tape):
+    out = copy.deepcopy(tape)
+    for entry in out:
+        if entry.get("dir") == "write":
+            frame = json.loads(entry["data"])
+            resp = frame.get("response") or {}
+            if frame.get("type") == "control_response" and "hookSpecificOutput" in json.dumps(resp):
+                resp["subtype"] = "error"
+                resp.pop("response", None)
+                resp["error"] = "recorded hook failed"
+                entry["data"] = json.dumps(frame)
     return out
 
 
-async def test_hook_mode_delivers_requests_inert_mode_drops_them():
-    tape = load_tape(_HOOKS)
-
-    options, keep = control_stub_options(tape)
-    assert keep == {"hook_callback"}
-    transport = ReplayTransport.from_tape(tape, keep_control_requests=keep)
-    await asyncio.wait_for(_drive_to_result(ClaudeSDKClient(options=options, transport=transport)), _TIMEOUT_S)
-    answered = _hook_responses(transport.writes)
-    assert len(answered) == 1
-    assert answered[0]["hookSpecificOutput"]["permissionDecision"] == "allow"
-
-    inert = ReplayTransport.from_tape(tape)  # default: Direction-B dropped
-    await asyncio.wait_for(_drive_to_result(ClaudeSDKClient(options=ClaudeAgentOptions(), transport=inert)), _TIMEOUT_S)
-    assert _hook_responses(inert.writes) == []
+async def test_replay_tape_stub_mode_raises_on_recorded_hook_error_envelope():
+    """A recorded hook *error* must not replay as a successful empty output."""
+    diverged = _make_hook_error_envelope(_hooks())
+    with pytest.raises(CassetteMismatchError, match="error envelope"):
+        await asyncio.wait_for(_drive(diverged, "stub"), _TIMEOUT_S)
 
 
-async def test_replay_tape_control_true_replays_hooks_to_result():
-    async def drive():
-        async with replay_tape(load_tape(_HOOKS), control=True) as client:
-            types = []
-            async for message in client.receive_messages():
-                types.append(type(message).__name__)
-                if types[-1] == "ResultMessage":
-                    break
-            return types
-    types = await asyncio.wait_for(drive(), _TIMEOUT_S)
-    assert types[-1] == "ResultMessage"
+def _scrub_hook_ids(tape):
+    out = copy.deepcopy(tape)
+    for entry in out:
+        if entry.get("dir") == "write":
+            frame = json.loads(entry["data"])
+            if frame.get("type") == "control_request" and frame["request"].get("subtype") == "initialize":
+                for matchers in (frame["request"].get("hooks") or {}).values():
+                    for matcher in matchers:
+                        matcher["hookCallbackIds"] = ["<scrubbed>"]
+                entry["data"] = json.dumps(frame)
+        frame = entry.get("frame") if entry.get("dir") == "read" else None
+        if frame and frame.get("type") == "control_request" \
+                and frame["request"].get("subtype") == "hook_callback":
+            frame["request"]["callback_id"] = "<scrubbed>"
+    return out
+
+
+async def test_replay_tape_stub_mode_raises_when_hook_ids_not_reproduced():
+    """Scrubbed/unreproducible hook ids: the wire-level initialize check must catch that
+    the live SDK assigned different ids, so the hooks-never-fired case isn't silent."""
+    diverged = _scrub_hook_ids(_hooks())
+    with pytest.raises(CassetteMismatchError, match="callback ids"):
+        await asyncio.wait_for(_drive(diverged, "stub"), _TIMEOUT_S)
+
+
+async def test_replay_tape_stub_mode_clears_prompt_tool_name_so_connect_succeeds():
+    """A caller passing permission_prompt_tool_name (SDK-incompatible with can_use_tool)
+    must still connect: the stub install clears it on the copy."""
+    await asyncio.wait_for(
+        _drive(_perm(), "stub", options=ClaudeAgentOptions(permission_prompt_tool_name="x")),
+        _TIMEOUT_S,
+    )

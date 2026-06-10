@@ -26,7 +26,7 @@ from .tape import (
     replayable_messages,
     serialize_tape,
 )
-from .control_stubs import build_hook_stubs, build_permission_stub, control_stub_options
+from .control_stubs import ControlReplayLedger, ControlStubBundle, control_stub_options
 from .drift import DriftFinding, check_tape, parse_drift
 from .transport import CassetteMismatchError, RecordingTransport, ReplayTransport
 
@@ -54,9 +54,9 @@ __all__ = [
     "direction_b_read_frames",
     "ControlExchange",
     "recorded_hook_config",
-    "build_permission_stub",
-    "build_hook_stubs",
     "control_stub_options",
+    "ControlStubBundle",
+    "ControlReplayLedger",
     "replay_tape",
     "parse_drift",
     "check_tape",
