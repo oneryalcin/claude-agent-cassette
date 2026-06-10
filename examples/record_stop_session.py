@@ -19,7 +19,6 @@ Run (spends a small API call; needs ANTHROPIC_API_KEY + the bundled claude CLI):
 from __future__ import annotations
 
 import asyncio
-import getpass
 import json
 import tempfile
 from pathlib import Path
@@ -28,7 +27,6 @@ from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
 
 from claude_agent_cassette import (
     default_replacements,
-    path_replacements,
     record,
     save_tape,
     scrub_init_inventory,
@@ -49,20 +47,6 @@ _PROMPT = (
 # Interrupt after this many stream_event deltas — far enough in that generation
 # is demonstrably underway, early enough that the tape stays small.
 _EVENTS_BEFORE_INTERRUPT = 5
-
-
-def _replacements(config_dir: str, cwd: str) -> list[tuple[str, str]]:
-    """The recording's full fingerprint: cwd/home/key (raw + slug forms via the
-    library defaults), the recording-specific dirs, the whole temp root (its path
-    embeds a stable per-user hash on macOS), and the bare username (tool output
-    like ``ls -la`` prints it outside any path)."""
-    return (
-        default_replacements()
-        + path_replacements(cwd, "<CWD>")
-        + path_replacements(config_dir, "<CONFIG>")
-        + path_replacements(tempfile.gettempdir(), "<TMP>")
-        + [(getpass.getuser(), "<USER>")]
-    )
 
 
 def _summary(scrubbed: list[dict]) -> None:
@@ -128,7 +112,9 @@ async def main() -> None:
                     if name == "ResultMessage":
                         break
 
-        scrubbed = scrub_init_inventory(scrub_tape(tape, _replacements(config_dir, cwd)))
+        scrubbed = scrub_init_inventory(
+            scrub_tape(tape, default_replacements(cwd=cwd, config_dir=config_dir, username=True))
+        )
     save_tape(scrubbed, _OUT)
     print(f"\nWrote {len(scrubbed)} frames -> {_OUT}")
     _summary(scrubbed)

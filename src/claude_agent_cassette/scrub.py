@@ -16,10 +16,11 @@ tape is still replayable.
 from __future__ import annotations
 
 import copy
+import getpass
 import json
 import os
 import re
-from typing import Any, Sequence
+from typing import Any, Optional, Sequence
 
 from .tape import TapeEntry
 
@@ -32,11 +33,13 @@ def path_replacements(path: str, mask: str) -> list[tuple[str, str]]:
     """Every wire form of ``path`` as (needle, mask) pairs: raw, realpath, and the
     CLI's **slug encoding**.
 
-    The CLI embeds paths slug-encoded (every non-alphanumeric character becomes
-    ``-``) in ``~/.claude/projects/<slug>/…`` strings — ``system/init.memory_paths``,
-    hook-input ``transcript_path``. A literal substring scrub can never match the
-    slug (``/Users/alice/proj`` rides the wire as ``-Users-alice-proj``), so a
-    path's slug forms must be needles of their own.
+    The CLI embeds paths slug-encoded in ``~/.claude/projects/<slug>/…`` strings —
+    ``system/init.memory_paths``, hook-input ``transcript_path``. A literal
+    substring scrub can never match the slug (``/Users/alice/proj`` rides the wire
+    as ``-Users-alice-proj``), so a path's slug forms must be needles of their own.
+    The encoding (every non-alphanumeric character becomes ``-``) is derived from
+    observed CLI output, not a spec — the committed-fixture hygiene test backstops
+    it for this repo's tapes.
     """
     slug = re.sub(r"[^A-Za-z0-9]", "-", path)
     real = os.path.realpath(path)
@@ -46,13 +49,35 @@ def path_replacements(path: str, mask: str) -> list[tuple[str, str]]:
     return pairs
 
 
-def default_replacements() -> list[tuple[str, str]]:
-    """The standard recording scrub: cwd, home (raw + realpath + slug forms), and
-    ``ANTHROPIC_API_KEY``. Extend with :func:`path_replacements` for other
-    recording-specific paths (a temp cwd, an isolated ``CLAUDE_CONFIG_DIR``)."""
+def default_replacements(
+    *,
+    cwd: Optional[str] = None,
+    config_dir: Optional[str] = None,
+    username: bool = False,
+) -> list[tuple[str, str]]:
+    """The standard recording scrub: cwd, home (raw + realpath + slug forms via
+    :func:`path_replacements`), and ``ANTHROPIC_API_KEY``.
+
+    The keyword extensions cover a *recording session's* full fingerprint (what
+    the example recorders use):
+
+    - ``cwd`` — the session's working dir when it differs from the process cwd
+      (the recorders run the CLI in a temp dir);
+    - ``config_dir`` — the isolated ``CLAUDE_CONFIG_DIR`` (hook transcript and
+      memory paths live under it);
+    - ``username`` — also mask the bare username: tool output like ``ls -la``
+      prints it outside any path. Opt-in because a short or common username
+      ("test") would over-mask legitimate content.
+    """
     pairs = path_replacements(os.getcwd(), "<CWD>") + path_replacements(
         os.path.expanduser("~"), "<HOME>"
     )
+    if cwd is not None:
+        pairs += path_replacements(cwd, "<CWD>")
+    if config_dir is not None:
+        pairs += path_replacements(config_dir, "<CONFIG>")
+    if username:
+        pairs.append((getpass.getuser(), "<USER>"))
     key = os.environ.get("ANTHROPIC_API_KEY")
     if key:
         pairs.append((key, "<REDACTED_API_KEY>"))

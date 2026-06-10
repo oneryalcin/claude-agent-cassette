@@ -1,12 +1,16 @@
 """scrub_tape: blank PII values while preserving structure + control decisions."""
 from __future__ import annotations
 
+import asyncio
 import json
+from pathlib import Path
 
 from claude_agent_cassette import (
     default_replacements,
     direction_b_exchanges,
+    load_tape,
     path_replacements,
+    replay_tape,
     scrub_init_inventory,
     scrub_tape,
 )
@@ -127,11 +131,6 @@ def test_init_inventory_scrub_output_shares_nothing_with_input():
 async def test_init_inventory_scrubbed_tape_still_replays():
     """The decision-preserving contract, end-to-end: replay never reads init
     inventory, so the scrub must not cost a tape its replayability."""
-    import asyncio
-    from pathlib import Path
-
-    from claude_agent_cassette import load_tape, replay_tape
-
     mcp = Path(__file__).parent.parent / "examples" / "cassettes" / "mcp_session.jsonl"
 
     async def drive() -> int:
@@ -170,3 +169,18 @@ def test_default_replacements_mask_cwd_home_and_key(monkeypatch):
     assert pairs.get(os.getcwd()) == "<CWD>"
     assert pairs.get(os.path.expanduser("~")) == "<HOME>"
     assert pairs.get("sk-ant-test-needle") == "<REDACTED_API_KEY>"
+
+
+def test_default_replacements_recording_session_form(monkeypatch):
+    """The recorders' one-call scrub: session cwd, isolated config dir, and the
+    bare username (the ls -la leak) must all become needles, slug forms included."""
+    import claude_agent_cassette.scrub as scrub_module
+
+    monkeypatch.setattr(scrub_module.getpass, "getuser", lambda: "alice")
+    pairs = dict(
+        default_replacements(cwd="/tmp/session_cwd", config_dir="/tmp/cfg", username=True)
+    )
+    assert pairs.get("/tmp/session_cwd") == "<CWD>"
+    assert pairs.get("-tmp-session-cwd") == "<CWD>"  # slug form
+    assert pairs.get("/tmp/cfg") == "<CONFIG>"
+    assert pairs.get("alice") == "<USER>"

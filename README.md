@@ -300,7 +300,7 @@ offline):
 | `direction_b_exchanges(tape)` → `{subtype: [ControlExchange]}` | inspect the recorded Direction-B decisions (what was allowed/denied/answered) |
 | `scrub_tape(tape, replacements)` | decision-preserving PII scrub for sharing a recording |
 | `scrub_init_inventory(tape)` | blank the environment inventory in `system/init` + the `initialize` handshake response |
-| `default_replacements()` / `path_replacements(path, mask)` | standard scrub needles — cwd/home/API key, in raw + realpath + slug-encoded forms |
+| `default_replacements(cwd=…, config_dir=…, username=…)` / `path_replacements(path, mask)` | standard scrub needles — cwd/home/API key (+ a recording session's dirs and username), in raw + realpath + slug-encoded forms |
 | `lint_tape(tape)` | lint a tape for Direction-B replayability (run after scrubbing) |
 | `check_drift(tape)` / `parse_drift(frames)` → `list[DriftFinding]` | drift findings vs the installed SDK |
 | `unmodeled_fields(frames)` / `field_drift(frames, baseline)` | field-level drift: recorded fields the installed SDK silently ignores |
