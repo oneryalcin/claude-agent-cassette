@@ -47,6 +47,10 @@ from claude_agent_sdk import (
 from claude_agent_cassette import record_sdk_wire, serialize_tape
 
 _OUT = Path(__file__).parent / "cassettes" / "permission_session.jsonl"
+# Pin a non-Covered (zero-data-retention-OK) model: the default rotated to Fable 5,
+# a Covered Model that requires data retention enabled. Direction-B control is
+# model-agnostic, so any capable model yields a valid fixture.
+_MODEL = "claude-haiku-4-5-20251001"
 
 # A task ordered to deterministically trigger one of each decision shape:
 #   1. list files            -> read-only tool   -> ALLOW
@@ -186,6 +190,7 @@ async def main() -> None:
             can_use_tool=deterministic_permission,
             permission_mode="default",  # ensures the callback is consulted
             cwd=cwd,
+            model=_MODEL,
         )
         print(f"Recording permission session in {cwd} ...\n")
         with record_sdk_wire() as tape:
