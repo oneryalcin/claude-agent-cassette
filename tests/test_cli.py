@@ -245,3 +245,16 @@ def test_nested_layout_baseline_lives_in_cassette_dir(capsys, tmp_path):
     assert main(["drift", str(tmp_path), "--update-field-baselines"]) == 0
     assert (nested / "fields.json").exists()
     assert main(["drift", str(tmp_path), "--fields"]) == 0
+
+
+def test_fields_and_update_baselines_are_mutually_exclusive(capsys, tmp_path):
+    """Combining the gate with the rewrite would normalize new drift into the
+    baseline and exit green — argparse must reject the combination up front."""
+    import pytest
+
+    _copy_mcp(tmp_path)
+    with pytest.raises(SystemExit) as exc:
+        main(["drift", str(tmp_path), "--fields", "--update-field-baselines"])
+    assert exc.value.code == 2  # EXIT_MISUSE, before anything is checked or written
+    assert "not allowed with" in capsys.readouterr().err
+    assert not (tmp_path / "session.fields.json").exists()  # nothing rewritten

@@ -237,13 +237,17 @@ def main(argv: list[str] | None = None) -> int:
              "cassette dir (default auto-detect '*/input.jsonl' when a dir has no "
              "top-level *.jsonl); passing it selects nested-only mode",
     )
-    drift.add_argument(
+    # Mutually exclusive by argparse: --update-field-baselines REWRITES what
+    # --fields gates against, so combining them would silently normalize new
+    # drift into the baseline and exit green — a fail-open gate.
+    field_mode = drift.add_mutually_exclusive_group()
+    field_mode.add_argument(
         "--fields", action="store_true",
         help="also gate field-level drift against each cassette's committed "
              "fields baseline (*.fields.json / fields.json sidecar); a cassette "
              "without a baseline fails closed",
     )
-    drift.add_argument(
+    field_mode.add_argument(
         "--update-field-baselines", action="store_true",
         help="(re)write each cassette's fields baseline from the installed SDK "
              "instead of gating against it",
