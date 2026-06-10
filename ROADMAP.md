@@ -7,11 +7,11 @@ Directional, not a promise. Issues/PRs welcome on any of these.
 - **Replay** — inject `ReplayTransport` into a real `ClaudeSDKClient`; recorded
   raw frames flow through the SDK's real parser. Answers the `initialize`
   control handshake. No API key, no subprocess.
-- **Record** — `RecordingTransport` (passive MITM tee) + `record_sdk_wire()`,
+- **Record** — `RecordingTransport` (passive MITM tee) + `record()`,
   which works with both `query()` and `ClaudeSDKClient`. Captures the **full
   duplex** wire, including the control plane.
 - **Tape format** — ordered, both-directions `TapeEntry` JSONL; serialize/load;
-  `conversation_messages()` to derive a conversation view.
+  `conversation_frames()` to derive a conversation view.
 - Runnable example, tests (replay + record, no key).
 
 ## Planned
@@ -57,7 +57,7 @@ Directional, not a promise. Issues/PRs welcome on any of these.
 - Curation helpers: trim a recorded tape to an essential conversation; CLI to
   turn a recorded tape into a replayable cassette.
 - **Redaction/scrub helper** — **shipped** (`scrub_tape`): blanks PII *values* while
-  keeping frame structure and control decisions intact. `direction_b_replay_findings`
+  keeping frame structure and control decisions intact. `lint_tape`
   lints whether a scrubbed tape is still replayable.
 
 ### 5. Assertion helpers (optional, light)

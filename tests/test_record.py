@@ -8,15 +8,14 @@ import json
 from claude_agent_cassette import (
     RecordingTransport,
     ReplayTransport,
-    record_sdk_wire,
+    record,
     replay,
-    serialize_tape,
 )
-from claude_agent_cassette.tape import conversation_messages
+from claude_agent_cassette.tape import conversation_frames, serialize_tape
 
 
-def test_record_sdk_wire_intercepts_both_query_and_client_paths():
-    """record_sdk_wire must wrap the transport for BOTH reach-the-transport paths.
+def test_record_intercepts_both_query_and_client_paths():
+    """record must wrap the transport for BOTH reach-the-transport paths.
 
     ClaudeSDKClient._connect_inner does a call-time import from the source module;
     one-shot query()/InternalClient.process_query uses the name bound in
@@ -25,7 +24,7 @@ def test_record_sdk_wire_intercepts_both_query_and_client_paths():
     """
     from claude_agent_sdk import ClaudeAgentOptions
 
-    with record_sdk_wire():
+    with record():
         # ClaudeSDKClient path: call-time import from the source module
         from claude_agent_sdk._internal.transport.subprocess_cli import (
             SubprocessCLITransport as ViaSource,
@@ -90,7 +89,7 @@ async def test_record_then_replay_round_trip():
     assert parsed == tape
 
     # the recorded conversation (minus the synthesised handshake) replays identically
-    replayed = await asyncio.wait_for(_kinds_via_replay(conversation_messages(tape)), 15)
+    replayed = await asyncio.wait_for(_kinds_via_replay(conversation_frames(tape)), 15)
     assert replayed == ["AssistantMessage", "ResultMessage"]
 
 

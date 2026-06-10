@@ -54,11 +54,11 @@ from claude_agent_sdk import (
 
 from .tape import (
     ControlExchange,
-    RawMessage,
+    Frame,
     TapeEntry,
     control_request_subtype,
     direction_b_exchanges,
-    read_frames,
+    inbound_frames,
     recorded_hook_config,
 )
 from .transport import CassetteMismatchError
@@ -114,7 +114,7 @@ class ControlReplayLedger:
             )
 
 
-class ControlStubBundle(NamedTuple):
+class ControlReplayBundle(NamedTuple):
     """What :func:`~claude_agent_cassette.replay_tape` needs to drive a Direction-B replay."""
 
     options: ClaudeAgentOptions  # a copy of the caller's options with replay stubs installed
@@ -265,7 +265,7 @@ def build_hook_stubs(
     return hooks
 
 
-def _mcp_rpc(exchange: ControlExchange) -> RawMessage:
+def _mcp_rpc(exchange: ControlExchange) -> Frame:
     """The recorded JSON-RPC response payload of an mcp_message exchange."""
     return exchange.decision.get("mcp_response") or {}
 
@@ -343,7 +343,7 @@ def build_mcp_stub_servers(
     servers: dict[str, McpSdkServerConfig] = {}
     for server_name, exchanges in by_server.items():
         info: dict[str, Any] = {}
-        tool_defs: list[RawMessage] = []
+        tool_defs: list[Frame] = []
         calls: dict[str, deque[ControlExchange]] = defaultdict(deque)
         for exchange in exchanges:
             message = exchange.request.get("message") or {}
@@ -380,7 +380,7 @@ def build_mcp_stub_servers(
     return servers
 
 
-def _iter_write_frames(writes: list[str]) -> Iterator[RawMessage]:
+def _iter_write_frames(writes: list[str]) -> Iterator[Frame]:
     """The parsed JSON objects of a transport's captured writes, skipping non-JSON."""
     for data in writes:
         try:
@@ -432,7 +432,7 @@ def verify_initialize_hook_ids(
         )
 
 
-def direction_b_replay_findings(tape: list[TapeEntry]) -> list[str]:
+def lint_tape(tape: list[TapeEntry]) -> list[str]:
     """Reasons a tape isn't fully Direction-B replayable (``mode="stub"``), or ``[]`` if it is.
 
     A lint, not a gate: run it after :func:`~claude_agent_cassette.scrub_tape` to confirm a
@@ -448,7 +448,7 @@ def direction_b_replay_findings(tape: list[TapeEntry]) -> list[str]:
         findings.append(f"{subtype}: not yet replayable (no stub builder)")
 
     paired_ids = {ex.request_id for group in exchanges.values() for ex in group}
-    for frame in read_frames(tape):
+    for frame in inbound_frames(tape):
         if frame.get("type") == "control_request" and frame.get("request_id") not in paired_ids:
             findings.append(
                 f"{control_request_subtype(frame)} request {frame.get('request_id')!r}: "
@@ -487,12 +487,12 @@ def direction_b_replay_findings(tape: list[TapeEntry]) -> list[str]:
     return findings
 
 
-def control_stub_options(
+def control_stub_bundle(
     tape: list[TapeEntry], base_options: ClaudeAgentOptions | None = None
-) -> ControlStubBundle:
+) -> ControlReplayBundle:
     """Wire Direction-B replay stubs for every subtype a tape contains.
 
-    Returns a :class:`ControlStubBundle` — a copy of ``base_options`` with replay stubs
+    Returns a :class:`ControlReplayBundle` — a copy of ``base_options`` with replay stubs
     installed, the ``control_request`` subtypes to keep in the inbound stream, and a
     :class:`ControlReplayLedger` to surface divergence after replay.
     :func:`~claude_agent_cassette.replay_tape` calls this; advanced callers can use it to
@@ -541,19 +541,19 @@ def control_stub_options(
         stub_servers: dict[str, Any] = dict(build_mcp_stub_servers(tape, ledger))
         options = dataclasses.replace(options, mcp_servers=stub_servers)
         keep.add("mcp_message")
-    return ControlStubBundle(options=options, keep_subtypes=keep, ledger=ledger)
+    return ControlReplayBundle(options=options, keep_subtypes=keep, ledger=ledger)
 
 
 # --- Verify mode: run the consumer's REAL callbacks and diff their decisions
 # against the recording, at the wire. ---
 
 
-def control_verify_options(
+def control_verify_bundle(
     tape: list[TapeEntry], base_options: ClaudeAgentOptions | None = None
-) -> ControlStubBundle:
+) -> ControlReplayBundle:
     """Precondition check for a Direction-B **verify** replay (``mode="verify"``).
 
-    Unlike :func:`control_stub_options`, nothing is replaced: the consumer's *real*
+    Unlike :func:`control_stub_bundle`, nothing is replaced: the consumer's *real*
     ``can_use_tool`` / ``hooks`` / SDK MCP servers stay installed, the recorded
     Direction-B requests are delivered to them, and :func:`verify_direction_b_decisions`
     diffs their answers against the recording after replay. This builder only validates
@@ -613,7 +613,7 @@ def control_verify_options(
                 "mode='stub' to replay the recorded results instead)"
             )
         keep.add("mcp_message")
-    return ControlStubBundle(options=options, keep_subtypes=keep, ledger=ControlReplayLedger())
+    return ControlReplayBundle(options=options, keep_subtypes=keep, ledger=ControlReplayLedger())
 
 
 def verify_direction_b_decisions(
@@ -641,7 +641,7 @@ def verify_direction_b_decisions(
         for group in direction_b_exchanges(tape).values()
         for ex in group
     }
-    live: dict[str, RawMessage] = {}
+    live: dict[str, Frame] = {}
     for frame in _iter_write_frames(writes):
         if frame.get("type") != "control_response":
             continue

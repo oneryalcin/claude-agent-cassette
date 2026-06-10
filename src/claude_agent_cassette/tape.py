@@ -15,7 +15,7 @@ from typing import Any, Literal, NamedTuple
 
 from typing_extensions import NotRequired, TypedDict
 
-RawMessage = dict[str, Any]
+Frame = dict[str, Any]
 Direction = Literal["read", "write"]
 
 
@@ -23,7 +23,7 @@ class TapeEntry(TypedDict):
     """One frame of a duplex recording. Exactly one payload, selected by ``dir``."""
 
     dir: Direction
-    frame: NotRequired[RawMessage]  # inbound (read)
+    frame: NotRequired[Frame]  # inbound (read)
     data: NotRequired[str]  # outbound (write)
 
 
@@ -32,12 +32,17 @@ def serialize_tape(tape: list[TapeEntry]) -> str:
     return "".join(json.dumps(entry) + "\n" for entry in tape)
 
 
+def save_tape(tape: list[TapeEntry], path: str | Path) -> None:
+    """Write a tape to a JSONL file (the inverse of :func:`load_tape`)."""
+    Path(path).write_text(serialize_tape(tape))
+
+
 def load_tape(path: str | Path) -> list[TapeEntry]:
     """Read a tape back from a JSONL file."""
     return [json.loads(line) for line in Path(path).read_text().splitlines() if line.strip()]
 
 
-def read_frames(tape: list[TapeEntry]) -> list[RawMessage]:
+def inbound_frames(tape: list[TapeEntry]) -> list[Frame]:
     """Inbound frames (CLI -> SDK), in order — the stream a ReplayTransport replays."""
     return [entry["frame"] for entry in tape if entry.get("dir") == "read"]
 
@@ -46,12 +51,12 @@ def read_frames(tape: list[TapeEntry]) -> list[RawMessage]:
 # control_request / control_response frames; everything else reads via these). ---
 
 
-def control_request_subtype(frame: RawMessage) -> str | None:
+def control_request_subtype(frame: Frame) -> str | None:
     """The subtype of a control_request frame (``initialize``, ``mcp_message``, …)."""
     return (frame.get("request") or {}).get("subtype")
 
 
-def _write_payload(entry: TapeEntry) -> RawMessage | None:
+def _write_payload(entry: TapeEntry) -> Frame | None:
     """The parsed JSON object of an outbound ``write`` entry, or None.
 
     Outbound frames store the raw payload *string* the SDK wrote; control-protocol
@@ -73,7 +78,7 @@ def _write_payload(entry: TapeEntry) -> RawMessage | None:
 _CONTROL_FRAME_TYPES = ("control_request", "control_response")
 
 
-def message_frames(frames: list[RawMessage]) -> list[RawMessage]:
+def message_frames(frames: list[Frame]) -> list[Frame]:
     """The frames that should parse to typed messages — i.e. not control frames.
 
     Control frames (``control_request``/``control_response``) ride the same stream
@@ -84,17 +89,21 @@ def message_frames(frames: list[RawMessage]) -> list[RawMessage]:
     return [f for f in frames if f.get("type") not in _CONTROL_FRAME_TYPES]
 
 
-def replayable_messages(tape: list[TapeEntry]) -> list[RawMessage]:
-    """Inbound conversation/system frames to feed the SDK's receive loop.
+def conversation_frames(tape: list[TapeEntry]) -> list[Frame]:
+    """The conversation-only inbound view — derive a replay's frames from a duplex tape.
 
     Every inbound frame that is neither a ``control_request`` (Direction B —
-    dropped so a consumer's registered callbacks stay inert on replay) nor a
-    ``control_response`` (answered out-of-band, see ``control_responses_by_subtype``).
+    dropped; kept, they would fire a consumer's callbacks on replay) nor a
+    ``control_response`` (a Direction-A answer the transport delivers
+    out-of-band). Feed the result to
+    :func:`~claude_agent_cassette.replay`, or save it as a frames file and load it
+    back with :func:`load_frames`. For a Direction-B replay that *keeps* the
+    control requests, use :func:`direction_b_read_frames`.
     """
-    return message_frames(read_frames(tape))
+    return message_frames(inbound_frames(tape))
 
 
-def control_responses_by_subtype(tape: list[TapeEntry]) -> dict[str, deque[RawMessage]]:
+def control_responses_by_subtype(tape: list[TapeEntry]) -> dict[str, deque[Frame]]:
     """Recorded Direction-A ``control_response`` frames, keyed by the subtype of the
     request they answered (per-subtype FIFO).
 
@@ -105,10 +114,10 @@ def control_responses_by_subtype(tape: list[TapeEntry]) -> dict[str, deque[RawMe
     """
     response_by_id = {
         (f.get("response") or {}).get("request_id"): f
-        for f in read_frames(tape)
+        for f in inbound_frames(tape)
         if f.get("type") == "control_response"
     }
-    by_subtype: dict[str, deque[RawMessage]] = defaultdict(deque)
+    by_subtype: dict[str, deque[Frame]] = defaultdict(deque)
     for entry in tape:
         request = _write_payload(entry)
         if request is None or request.get("type") != "control_request":
@@ -131,8 +140,8 @@ class ControlExchange(NamedTuple):
     """
 
     subtype: str  # the request subtype: can_use_tool / hook_callback / mcp_message
-    request: RawMessage  # the inbound control_request's ``request`` payload (tool_name, input, …)
-    decision: RawMessage  # the recorded answer — the control_response's inner ``response`` payload
+    request: Frame  # the inbound control_request's ``request`` payload (tool_name, input, …)
+    decision: Frame  # the recorded answer — the control_response's inner ``response`` payload
     succeeded: bool  # whether the recorded response envelope was ``success`` (vs ``error``)
     request_id: str  # the CLI-minted id correlating request↔decision (unused for stub matching)
 
@@ -153,7 +162,7 @@ def direction_b_exchanges(tape: list[TapeEntry]) -> dict[str, deque[ControlExcha
     correlate by subtype + payload shape + order — which is why this is keyed by
     subtype and preserves recorded order within each subtype.
     """
-    response_by_id: dict[str, RawMessage] = {}
+    response_by_id: dict[str, Frame] = {}
     for entry in tape:
         payload = _write_payload(entry)
         if payload is None or payload.get("type") != "control_response":
@@ -191,7 +200,7 @@ def direction_b_exchanges(tape: list[TapeEntry]) -> dict[str, deque[ControlExcha
 
 def direction_b_read_frames(
     tape: list[TapeEntry], keep_subtypes: set[str] | None = None
-) -> list[RawMessage]:
+) -> list[Frame]:
     """Inbound frames to feed the SDK for a **Direction-B** replay.
 
     Conversation/system frames PLUS the inbound Direction-B ``control_request``s
@@ -205,12 +214,12 @@ def direction_b_read_frames(
     a Direction-B subtype with no replay stub stays inert (dropped, exactly as in
     conversation-only replay) instead of reaching an unstubbed live callback.
 
-    Contrast :func:`replayable_messages`, which drops **all** control frames. Pair
+    Contrast :func:`conversation_frames`, which drops **all** control frames. Pair
     this with stub callbacks built from :func:`direction_b_exchanges` so the kept
     requests resolve to the recorded decisions instead of running live logic.
     """
-    frames: list[RawMessage] = []
-    for frame in read_frames(tape):
+    frames: list[Frame] = []
+    for frame in inbound_frames(tape):
         frame_type = frame.get("type")
         if frame_type == "control_response":
             continue
@@ -224,7 +233,7 @@ def direction_b_read_frames(
     return frames
 
 
-def recorded_hook_config(tape: list[TapeEntry]) -> RawMessage | None:
+def recorded_hook_config(tape: list[TapeEntry]) -> Frame | None:
     """The hook structure the SDK registered at ``initialize``, or ``None`` if none.
 
     Read from the recorded outbound ``initialize`` ``control_request``; shape is
@@ -244,22 +253,6 @@ def recorded_hook_config(tape: list[TapeEntry]) -> RawMessage | None:
     return None
 
 
-def conversation_messages(tape: list[TapeEntry]) -> list[RawMessage]:
-    """The conversation-only inbound view — derive a replay cassette from a duplex tape.
-
-    Conversation/system frames only; **every** control frame is dropped:
-    ``control_response`` (Direction-A answers, which the transport handles out-of-band)
-    and ``control_request`` (Direction B — kept here would fire a consumer's callbacks
-    on replay). A synonym of :func:`replayable_messages`, exposed as the public name for
-    turning a recorded tape into a conversation cassette.
-
-    (This previously kept ``control_request`` frames, contradicting both this contract
-    and its name. For a Direction-B replay that *keeps* them, use
-    :func:`direction_b_read_frames`.)
-    """
-    return replayable_messages(tape)
-
-
-def load_cassette(path: str | Path) -> list[RawMessage]:
-    """Load a replay cassette: a JSONL file of raw inbound frames to replay."""
+def load_frames(path: str | Path) -> list[Frame]:
+    """Load a frames file: JSONL of raw inbound frames, ready for :func:`~claude_agent_cassette.replay`."""
     return [json.loads(line) for line in Path(path).read_text().splitlines() if line.strip()]

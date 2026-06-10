@@ -6,7 +6,7 @@ tool?") and the SDK invokes the consumer's ``can_use_tool`` callback, then write
 the decision back. Those frames only exist if a real session registered the
 callback *and* tried to use tools — so we record one.
 
-This runs a permission-gated agent task under ``record_sdk_wire()``, which tees the
+This runs a permission-gated agent task under ``record()``, which tees the
 full duplex wire (including the ``can_use_tool`` control_request and our decision
 control_response) into a tape.
 
@@ -44,7 +44,7 @@ from claude_agent_sdk import (
     ToolPermissionContext,
 )
 
-from claude_agent_cassette import record_sdk_wire, scrub_tape, serialize_tape
+from claude_agent_cassette import record, save_tape, scrub_tape
 
 _OUT = Path(__file__).parent / "cassettes" / "permission_session.jsonl"
 # Pin a non-Covered (zero-data-retention-OK) model: the default rotated to Fable 5,
@@ -151,7 +151,7 @@ async def main() -> None:
             model=_MODEL,
         )
         print(f"Recording permission session in {cwd} ...\n")
-        with record_sdk_wire() as tape:
+        with record() as tape:
             async with ClaudeSDKClient(options) as client:
                 await client.query(_PROMPT)
                 async for message in client.receive_response():
@@ -160,7 +160,7 @@ async def main() -> None:
 
         scrubbed = scrub_tape(tape, _pii_replacements(cwd))
         _OUT.parent.mkdir(parents=True, exist_ok=True)
-        _OUT.write_text(serialize_tape(scrubbed))
+        save_tape(scrubbed, _OUT)
         print(f"\nWrote {len(scrubbed)} frames -> {_OUT}")
         _summary(scrubbed)
 

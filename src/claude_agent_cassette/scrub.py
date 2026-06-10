@@ -9,7 +9,7 @@ the older websearch fixture, which scrubbed its decisions and made itself unrepl
 :func:`scrub_tape` does value-substitution only: it replaces known-sensitive substrings
 (absolute paths, API keys) in string values and never drops or reshapes a frame, so
 control-plane decisions ride through unless a needle literally occurs inside one. Pair it
-with :func:`~claude_agent_cassette.direction_b_replay_findings` to confirm the scrubbed
+with :func:`~claude_agent_cassette.lint_tape` to confirm the scrubbed
 tape is still replayable.
 """
 
@@ -21,16 +21,16 @@ from typing import Any
 from .tape import TapeEntry
 
 
-def _redact(obj: Any, replacements: list[tuple[str, str]]) -> Any:
+def _scrub_values(obj: Any, replacements: list[tuple[str, str]]) -> Any:
     """Recursively substitute needle→mask in every string value; structure untouched."""
     if isinstance(obj, str):
         for needle, mask in replacements:
             obj = obj.replace(needle, mask)
         return obj
     if isinstance(obj, list):
-        return [_redact(v, replacements) for v in obj]
+        return [_scrub_values(v, replacements) for v in obj]
     if isinstance(obj, dict):
-        return {k: _redact(v, replacements) for k, v in obj.items()}
+        return {k: _scrub_values(v, replacements) for k, v in obj.items()}
     return obj
 
 
@@ -39,7 +39,7 @@ def scrub_tape(tape: list[TapeEntry], replacements: list[tuple[str, str]]) -> li
 
     ``replacements`` is applied **longest-needle-first**, so a specific path
     (``/private/var/…/tmpX``) is masked before a shorter prefix of it (``/var/…/tmpX``)
-    can match inside it. Outbound ``write`` payloads are parsed, redacted, and
+    can match inside it. Outbound ``write`` payloads are parsed, scrubbed, and
     re-serialized so a masked value can't survive as raw JSON text. Empty needles are
     ignored. Nothing is dropped or reshaped — only string values are substituted, so
     control-plane decisions (``behavior`` / ``updatedInput`` / hook output /
@@ -53,9 +53,9 @@ def scrub_tape(tape: list[TapeEntry], replacements: list[tuple[str, str]]) -> li
             try:
                 payload = json.loads(data)
             except ValueError:
-                scrubbed.append(_redact(entry, ordered))
+                scrubbed.append(_scrub_values(entry, ordered))
                 continue
-            scrubbed.append({"dir": "write", "data": json.dumps(_redact(payload, ordered))})
+            scrubbed.append({"dir": "write", "data": json.dumps(_scrub_values(payload, ordered))})
         else:
-            scrubbed.append(_redact(entry, ordered))
+            scrubbed.append(_scrub_values(entry, ordered))
     return scrubbed

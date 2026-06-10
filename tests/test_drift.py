@@ -10,7 +10,7 @@ from pathlib import Path
 
 from claude_agent_sdk._internal.message_parser import parse_message
 
-from claude_agent_cassette import check_tape, parse_drift
+from claude_agent_cassette import check_drift, parse_drift
 from claude_agent_cassette.tape import load_tape
 
 _TAPE = Path(__file__).parent / "fixtures" / "websearch_control_tape.jsonl"
@@ -46,7 +46,7 @@ def test_parse_message_can_raise_non_messageparseerror():
 # --- the detector ---
 
 def test_clean_fixture_has_no_drift():
-    assert check_tape(load_tape(_TAPE)) == []
+    assert check_drift(load_tape(_TAPE)) == []
 
 
 def test_renamed_type_is_unrecognized_drift():
@@ -118,12 +118,12 @@ def test_string_content_is_not_block_checked():
 
 
 def test_check_tape_excludes_control_frames():
-    """Control frames return None from parse_message; check_tape must not flag them
-    (they are excluded via replayable_messages, not message-parsed)."""
+    """Control frames return None from parse_message; check_drift must not flag them
+    (they are excluded via conversation_frames, not message-parsed)."""
     tape = load_tape(_TAPE)
     # sanity: the tape really does carry control frames that would be None
     assert any(
         e.get("dir") == "read" and e["frame"].get("type") == "control_response"
         for e in tape
     )
-    assert check_tape(tape) == []  # yet no drift, because control frames are excluded
+    assert check_drift(tape) == []  # yet no drift, because control frames are excluded

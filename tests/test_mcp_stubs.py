@@ -26,14 +26,16 @@ from claude_agent_sdk import (
 
 from claude_agent_cassette import (
     CassetteMismatchError,
-    ControlReplayLedger,
     ReplayTransport,
-    build_mcp_stub_servers,
-    control_stub_options,
-    control_verify_options,
-    direction_b_replay_findings,
+    lint_tape,
     load_tape,
     replay_tape,
+)
+from claude_agent_cassette.direction_b import (
+    ControlReplayLedger,
+    build_mcp_stub_servers,
+    control_stub_bundle,
+    control_verify_bundle,
     verify_direction_b_decisions,
 )
 
@@ -85,9 +87,9 @@ async def test_stub_mcp_reproduces_recorded_wire_exactly():
     """The acid test: diff the synthesized server's live answers against the recording
     with the verify comparator — every recorded exchange, byte-for-byte."""
     tape = _tape()
-    bundle = control_stub_options(tape)
+    bundle = control_stub_bundle(tape)
     assert bundle.keep_subtypes == {"mcp_message"}
-    transport = ReplayTransport.from_tape(tape, keep_control_requests=bundle.keep_subtypes)
+    transport = ReplayTransport.from_tape(tape, keep_subtypes=bundle.keep_subtypes)
     client = ClaudeSDKClient(options=bundle.options, transport=transport)
     await client.connect()
     async for message in client.receive_messages():
@@ -214,7 +216,7 @@ async def test_verify_raises_when_tool_result_changed():
 
 def test_verify_requires_matching_sdk_server():
     with pytest.raises(CassetteMismatchError, match="mcp_servers"):
-        control_verify_options(_tape(), ClaudeAgentOptions())
+        control_verify_bundle(_tape(), ClaudeAgentOptions())
 
 
 # --- Builder + lint ---
@@ -229,9 +231,9 @@ def test_build_mcp_stub_servers_reconstructs_recorded_identity():
 
 
 def test_findings_clean_for_mcp_fixture():
-    assert direction_b_replay_findings(_tape()) == []
+    assert lint_tape(_tape()) == []
 
 
 def test_findings_flag_recorded_jsonrpc_error():
-    findings = direction_b_replay_findings(_with_jsonrpc_error(_tape(), "divide"))
+    findings = lint_tape(_with_jsonrpc_error(_tape(), "divide"))
     assert any("JSON-RPC error" in f for f in findings)
