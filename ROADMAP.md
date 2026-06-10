@@ -16,21 +16,20 @@ Directional, not a promise. Issues/PRs welcome on any of these.
 
 ## Planned
 
-### 1. Control-protocol replay (highest value)
-Today `replay()` covers the **conversation** stream and synthesises a generic
-handshake response; it does not faithfully replay the control plane. Recordings
-*already capture* control frames, so the recording side is ready — the work is on
-replay:
-
-- **Direction A** (SDK→CLI: `initialize`, `mcp_status`, `interrupt`, `set_model`,
-  …): replay the *recorded* response content, remapping the recorded `request_id`
-  to the live one the SDK mints each run (instead of a generic success).
-- **Direction B** (CLI→SDK: `can_use_tool`, `hook_callback`, `mcp_message`): the
-  SDK invokes real callbacks on these — replay must **stub** them to the recorded
-  decision so replay stays inert (no live permission/hook/MCP execution).
-
-This is where a whole class of bugs lives (interrupt/Stop handling, permission
-denials, hook ordering, in-process MCP), so it's the priority.
+### 1. Control-protocol replay
+- **Direction A** (SDK→CLI: `initialize`, `mcp_status`, …) — **shipped**
+  (`ReplayTransport.from_tape`): the recorded response is replayed, id-remapped to the
+  live request.
+- **Direction B** (CLI→SDK: `can_use_tool`, `hook_callback`, `mcp_message`) — **stub
+  replay shipped** for `can_use_tool` + `hook_callback` (`replay_tape(mode="stub")`):
+  the recorded requests are delivered and answered from the tape by stubs, fail-closed
+  end-to-end on divergence. Remaining:
+  - **`mcp_message`** stubbing — synthesize an in-process MCP server from the recorded
+    `initialize` / `tools/list` / `tools/call` results.
+  - **`verify` mode** — run the consumer's *real* callbacks and assert their decisions
+    match the recording (tests the policy, not just the wire). The `mode` enum has room.
+  - **`interrupt` lockstep** — ordering-sensitive Direction-A control where a conversation
+    frame must land after a control exchange.
 
 ### 2. pytest integration
 - Cassette discovery + a fixture/marker (`@pytest.mark.cassette("name")`).
@@ -49,9 +48,9 @@ denials, hook ordering, in-process MCP), so it's the priority.
 ### 4. Cassette tooling
 - Curation helpers: trim a recorded tape to an essential conversation; CLI to
   turn a recorded tape into a replayable cassette.
-- **Redaction/scrub helper** — blank prompt/document/PII *values* while keeping
-  frame structure byte-faithful, so recordings can be shared safely. (Scrub
-  values, drop whole frames; never reshape.)
+- **Redaction/scrub helper** — **shipped** (`scrub_tape`): blanks PII *values* while
+  keeping frame structure and control decisions intact. `direction_b_replay_findings`
+  lints whether a scrubbed tape is still replayable.
 
 ### 5. Assertion helpers (optional, light)
 - Ordered-subsequence + exhaustive-type matching over emitted messages, so users

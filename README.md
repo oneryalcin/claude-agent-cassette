@@ -128,6 +128,41 @@ drift: 5 cassette(s) vs claude-agent-sdk 0.2.87
 
 In Python: `parse_drift(frames)` / `check_tape(tape)` → `list[DriftFinding]`.
 
+## Control-protocol replay (the duplex wire)
+
+`replay_tape(tape, mode=...)` replays a full duplex recording, including the control
+plane, through a real `ClaudeSDKClient`. Break at the terminal `ResultMessage` (the
+stream stays open after it, like the real wire):
+
+```python
+from claude_agent_cassette import replay_tape, load_tape
+
+async def test_permission_flow():
+    async with replay_tape(load_tape("session.jsonl"), mode="stub") as client:
+        async for m in client.receive_messages():
+            if type(m).__name__ == "ResultMessage":
+                break
+```
+
+- **`mode="inert"`** (default) — conversation + **Direction-A** control replay: the
+  `initialize` / `mcp_status` handshakes are answered from the recording; inbound
+  **Direction-B** requests (`can_use_tool` / `hook_callback` / `mcp_message`) are
+  dropped, so your registered callbacks stay inert.
+- **`mode="stub"`** — also replay **Direction-B**: the recorded requests are delivered
+  to the SDK and answered from the tape by stubs that **replace** your `can_use_tool` /
+  hooks. Deterministic and inert — it certifies the recorded *wire*, not your policy.
+  (A future `"verify"` mode will run your real callbacks and assert they match.)
+- **Fail-closed end-to-end.** In `"stub"` mode, any divergence from the tape — a live
+  request with no recorded match, an exhausted or error decision, hook ids the SDK
+  didn't reproduce, or recorded exchanges left unreplayed — raises `CassetteMismatchError`
+  when the `async with` exits. (The SDK swallows callback exceptions into error
+  responses, so the divergence is collected and surfaced on exit, not inside the stub.)
+  A subtype with no stub builder yet (`mcp_message`) raises up front — use `mode="inert"`.
+- **Recording** a Direction-B tape needs the control decisions preserved. `scrub_tape(tape,
+  replacements)` blanks PII *values* while keeping decisions intact; `direction_b_replay_findings(tape)`
+  lints whether a tape is still replayable (run it after scrubbing). See
+  [`examples/record_permission_session.py`](examples/record_permission_session.py).
+
 ## Examples
 
 [`examples/`](examples/) has a runnable, no-key demo:
@@ -147,12 +182,16 @@ see above.)
 
 | | |
 | --- | --- |
-| `replay(messages, options=None)` | async CM → a connected `ClaudeSDKClient` over a `ReplayTransport` |
-| `ReplayTransport(messages)` | raw frames → real parser (answers the initialize handshake) |
+| `replay(messages, options=None)` | async CM → a connected `ClaudeSDKClient` over a `ReplayTransport` (conversation cassette) |
+| `replay_tape(tape, options=None, mode="inert"\|"stub")` | async CM → replay a full duplex tape incl. the control plane |
+| `ReplayTransport(messages)` / `.from_tape(tape, keep_control_requests=None)` | raw frames → real parser (answers the initialize handshake) |
 | `RecordingTransport(inner, tape)` | passive MITM tee, both directions |
 | `record_sdk_wire()` | CM that wraps the SDK's transport to capture a query's wire |
 | `serialize_tape` / `load_tape` / `load_cassette` | tape & cassette I/O |
 | `read_frames(tape)` / `conversation_messages(tape)` | derive replay views from a tape |
+| `control_stub_options(tape, base=None)` → `ControlStubBundle` | wire Direction-B stubs + keep-set + divergence ledger by hand |
+| `scrub_tape(tape, replacements)` | decision-preserving PII scrub for sharing a recording |
+| `direction_b_replay_findings(tape)` | lint a tape for Direction-B replayability |
 | `parse_drift(frames)` / `check_tape(tape)` | drift findings vs the installed SDK |
 | `claude-agent-cassette drift <path…>` | CLI drift gate (non-zero on drift / empty) |
 
@@ -179,10 +218,12 @@ version-sensitive is the point: it tells you *when* a bump broke a cassette.)
 ## Roadmap
 
 See [ROADMAP.md](ROADMAP.md). Shipped: conversation replay, recording,
-**Direction-A control replay** (`ReplayTransport.from_tape`), and **drift
-detection**. Next up: faithful **Direction-B** control replay
-(`can_use_tool`/`hook_callback`/`mcp_message` stubbing) + `interrupt` lockstep, a
-pytest plugin with record-on-miss, field-level drift, and a redaction helper.
+**Direction-A control replay** (`ReplayTransport.from_tape`), **drift detection**,
+**Direction-B stub replay** (`replay_tape(mode="stub")` for `can_use_tool` /
+`hook_callback`), and a **decision-preserving scrub** (`scrub_tape`). Next up:
+`mcp_message` stubbing, a **`verify` mode** (run your real callbacks, assert they match
+the tape), `interrupt` lockstep, a pytest plugin with record-on-miss, and field-level
+drift.
 
 ## License
 
