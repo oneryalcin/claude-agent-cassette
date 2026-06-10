@@ -69,16 +69,17 @@ async def replay_tape(
       ``initialize`` / ``mcp_status`` handshakes are answered from the recording; inbound
       **Direction-B** requests are dropped so registered callbacks stay inert.
     - ``mode="stub"``: also replay **Direction-B** — the recorded ``can_use_tool`` /
-      ``hook_callback`` requests are delivered to the SDK and answered from the tape by
-      auto-installed stubs that **replace** the corresponding callbacks in ``options``.
-      Deterministic and inert: your live permission/hook logic does not run; this
-      certifies the recorded *wire*, not your policy.
+      ``hook_callback`` / ``mcp_message`` requests are delivered to the SDK and answered
+      from the tape by auto-installed stubs that **replace** the corresponding callbacks
+      (and SDK MCP servers) in ``options``. Deterministic and inert: your live
+      permission/hook/tool logic does not run; this certifies the recorded *wire*, not
+      your policy.
     - ``mode="verify"``: the recorded Direction-B requests are delivered to **your
-      real** ``can_use_tool`` / ``hooks`` from ``options`` (nothing is replaced), and
-      on exit each live decision is diffed against the recorded one — matched exactly
-      by ``request_id``, at the wire. This certifies that your policy still produces
-      the recorded decisions; a changed decision, a callback that now raises (or no
-      longer does), or an unanswered exchange is divergence.
+      real** ``can_use_tool`` / ``hooks`` / SDK MCP servers from ``options`` (nothing is
+      replaced), and on exit each live decision is diffed against the recorded one —
+      matched exactly by ``request_id``, at the wire. This certifies that your policy
+      still produces the recorded decisions; a changed decision, a callback that now
+      raises (or no longer does), or an unanswered exchange is divergence.
 
     **Fail-closed end-to-end.** In ``"stub"`` and ``"verify"`` modes, divergence from
     the tape — a live request with no recorded match, an exhausted or error-envelope
@@ -87,8 +88,8 @@ async def replay_tape(
     :class:`~claude_agent_cassette.CassetteMismatchError` when the ``async with`` block
     exits cleanly. (The raise happens here, not inside the callback: the SDK swallows
     callback exceptions into error responses, so the divergence is collected and
-    surfaced on exit.) A tape carrying a Direction-B subtype with no replay support yet
-    (``mcp_message``) raises up front — use ``mode="inert"`` for it.
+    surfaced on exit.) A tape carrying a Direction-B subtype with no replay support
+    (one a future SDK adds) raises up front — use ``mode="inert"`` for it.
 
     As with :func:`replay`, break at the terminal ``ResultMessage``; the stream stays
     open after it and ends on ``disconnect()``.

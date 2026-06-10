@@ -44,9 +44,12 @@ from typing import Any, Awaitable, Callable, Iterator, NamedTuple
 from claude_agent_sdk import (
     ClaudeAgentOptions,
     HookMatcher,
+    McpSdkServerConfig,
     PermissionResultAllow,
     PermissionResultDeny,
     ToolPermissionContext,
+    create_sdk_mcp_server,
+    tool,
 )
 
 from .tape import (
@@ -65,9 +68,10 @@ CanUseTool = Callable[
     Awaitable["PermissionResultAllow | PermissionResultDeny"],
 ]
 
-# Direction-B subtypes this module can replay today. A tape carrying any other
-# Direction-B subtype (e.g. ``mcp_message``) is not yet stub-replayable.
-SUPPORTED_SUBTYPES = frozenset({"can_use_tool", "hook_callback"})
+# Direction-B subtypes this module can replay today — all three the SDK handles.
+# The check stays as future-proofing: a tape carrying a subtype a future SDK adds
+# fails closed instead of replaying a subset.
+SUPPORTED_SUBTYPES = frozenset({"can_use_tool", "hook_callback", "mcp_message"})
 
 
 class ControlReplayLedger:
@@ -261,6 +265,121 @@ def build_hook_stubs(
     return hooks
 
 
+def _mcp_rpc(exchange: ControlExchange) -> RawMessage:
+    """The recorded JSON-RPC response payload of an mcp_message exchange."""
+    return exchange.decision.get("mcp_response") or {}
+
+
+def _make_mcp_tool_stub(
+    server_name: str, tool_name: str, recorded: deque[ControlExchange], ledger: ControlReplayLedger
+) -> Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]:
+    """A tool handler that replays the recorded ``tools/call`` results (FIFO).
+
+    Firing more times than recorded, arguments that differ from the recording, a
+    recorded control-level *error* envelope, or a recorded JSON-RPC *error* (the
+    original tool blew up below the handler) is divergence — recorded into ``ledger``
+    and raised.
+    """
+
+    async def handler(args: dict[str, Any]) -> dict[str, Any]:
+        label = f"mcp_message tools/call {server_name}.{tool_name}"
+        if not recorded:
+            msg = f"{label} called more times than recorded; the live MCP sequence diverged"
+            ledger.record(msg)
+            raise CassetteMismatchError(msg)
+        exchange = recorded.popleft()
+        recorded_args = ((exchange.request.get("message") or {}).get("params") or {}).get(
+            "arguments"
+        )
+        if args != recorded_args:
+            msg = f"{label}: live arguments {args!r} diverged from recorded {recorded_args!r}"
+            ledger.record(msg)
+            raise CassetteMismatchError(msg)
+        if not exchange.succeeded:
+            msg = f"{label}: recorded an error envelope, not a result — cannot replay it"
+            ledger.record(msg)
+            raise CassetteMismatchError(msg)
+        rpc = _mcp_rpc(exchange)
+        if "result" not in rpc:
+            msg = (
+                f"{label}: recorded a JSON-RPC error ({rpc.get('error')!r}), not a result — "
+                "cannot replay it through a real tool handler"
+            )
+            ledger.record(msg)
+            raise CassetteMismatchError(msg)
+        result = rpc["result"] or {}
+        out: dict[str, Any] = {"content": result.get("content") or []}
+        if result.get("isError"):
+            out["is_error"] = True
+        return out
+
+    return handler
+
+
+def build_mcp_stub_servers(
+    tape: list[TapeEntry], ledger: ControlReplayLedger
+) -> dict[str, McpSdkServerConfig]:
+    """In-process SDK MCP servers that replay the tape's recorded ``mcp_message`` traffic.
+
+    One *real* ``create_sdk_mcp_server`` per recorded ``server_name``, reconstructed
+    entirely from the tape: the server identity from the recorded ``initialize``
+    response's ``serverInfo``, the tool list (names, descriptions, raw JSON-Schema
+    ``inputSchema``) from the recorded ``tools/list`` response, and each tool's results
+    from the recorded ``tools/call`` exchanges (FIFO per tool, tracked for leftovers).
+
+    Going through the real server machinery — rather than faking the SDK's internal
+    routing — means ``initialize`` / ``notifications/initialized`` / ``tools/list`` are
+    answered by the SDK's own (stateless) paths, and the replay survives the SDK's
+    planned MCP-transport refactor. A tool called at replay that the recording never
+    listed gets a minimal definition (empty schema) so a truncated recording — calls
+    recorded, ``tools/list`` lost — still replays its calls.
+    """
+    by_server: dict[str, list[ControlExchange]] = defaultdict(list)
+    for exchange in direction_b_exchanges(tape).get("mcp_message", ()):
+        server_name = exchange.request.get("server_name")
+        if server_name is not None:
+            by_server[server_name].append(exchange)
+
+    servers: dict[str, McpSdkServerConfig] = {}
+    for server_name, exchanges in by_server.items():
+        info: dict[str, Any] = {}
+        tool_defs: list[RawMessage] = []
+        calls: dict[str, deque[ControlExchange]] = defaultdict(deque)
+        for exchange in exchanges:
+            message = exchange.request.get("message") or {}
+            method = message.get("method")
+            if method == "initialize" and not info:
+                info = (_mcp_rpc(exchange).get("result") or {}).get("serverInfo") or {}
+            elif method == "tools/list" and not tool_defs:
+                tool_defs = (_mcp_rpc(exchange).get("result") or {}).get("tools") or []
+            elif method == "tools/call":
+                name = (message.get("params") or {}).get("name")
+                if name is not None:
+                    calls[name].append(exchange)
+
+        listed = {td.get("name") for td in tool_defs}
+        # New list — tool_defs aliases the recorded payload inside the tape.
+        tool_defs = list(tool_defs) + [{"name": name} for name in calls if name not in listed]
+
+        stubs = []
+        for td in tool_defs:
+            name = td["name"]
+            ledger.track(f"mcp_message tools/call [{server_name}.{name}]", calls[name])
+            stubs.append(
+                tool(
+                    name,
+                    td.get("description") or "",
+                    td.get("inputSchema") or {"type": "object", "properties": {}},
+                )(_make_mcp_tool_stub(server_name, name, calls[name], ledger))
+            )
+        servers[server_name] = create_sdk_mcp_server(
+            name=info.get("name") or server_name,
+            version=info.get("version") or "1.0.0",
+            tools=stubs,
+        )
+    return servers
+
+
 def _iter_write_frames(writes: list[str]) -> Iterator[RawMessage]:
     """The parsed JSON objects of a transport's captured writes, skipping non-JSON."""
     for data in writes:
@@ -346,6 +465,15 @@ def direction_b_replay_findings(tape: list[TapeEntry]) -> list[str]:
                 findings.append(
                     f"{subtype} {exchange.request_id!r}: decision is scrubbed — not replayable"
                 )
+            elif (
+                subtype == "mcp_message"
+                and ((exchange.request.get("message") or {}).get("method")) == "tools/call"
+                and "result" not in _mcp_rpc(exchange)
+            ):
+                findings.append(
+                    f"mcp_message {exchange.request_id!r}: tools/call recorded a JSON-RPC "
+                    "error, not a result — not replayable through a real tool handler"
+                )
 
     config = recorded_hook_config(tape)
     if config:
@@ -370,9 +498,9 @@ def control_stub_options(
     :func:`~claude_agent_cassette.replay_tape` calls this; advanced callers can use it to
     wire the transport and options by hand.
 
-    **Fail-closed, not best-effort.** If the tape contains a Direction-B subtype that
-    can't be faithfully replayed — one with no stub builder yet (``mcp_message``) — this
-    raises :class:`~claude_agent_cassette.CassetteMismatchError` rather than silently
+    **Fail-closed, not best-effort.** If the tape contains a Direction-B subtype with
+    no stub builder (one a future SDK adds), this raises
+    :class:`~claude_agent_cassette.CassetteMismatchError` rather than silently
     replaying a subset. Use ``mode="inert"`` to replay the conversation without the
     control plane. (Hooks whose ids can't be reproduced are caught at replay by
     :func:`verify_initialize_hook_ids`, not dropped silently.)
@@ -407,6 +535,12 @@ def control_stub_options(
             # them as a HookEvent literal and validates at runtime.
             options = dataclasses.replace(options, hooks=hooks)  # type: ignore[arg-type]
             keep.add("hook_callback")
+    if exchanges.get("mcp_message"):
+        # Wholesale replacement, like the other stubs: in stub mode no live MCP
+        # server may run, and only the recorded server_names are ever routed to.
+        stub_servers: dict[str, Any] = dict(build_mcp_stub_servers(tape, ledger))
+        options = dataclasses.replace(options, mcp_servers=stub_servers)
+        keep.add("mcp_message")
     return ControlStubBundle(options=options, keep_subtypes=keep, ledger=ledger)
 
 
@@ -420,16 +554,16 @@ def control_verify_options(
     """Precondition check for a Direction-B **verify** replay (``mode="verify"``).
 
     Unlike :func:`control_stub_options`, nothing is replaced: the consumer's *real*
-    ``can_use_tool`` / ``hooks`` stay installed, the recorded Direction-B requests are
-    delivered to them, and :func:`verify_direction_b_decisions` diffs their answers
-    against the recording after replay. This builder only validates that every recorded
-    subtype has a live handler to run — a recording with permission exchanges but no
-    live ``can_use_tool`` (or hook exchanges but no live ``hooks``) is itself
+    ``can_use_tool`` / ``hooks`` / SDK MCP servers stay installed, the recorded
+    Direction-B requests are delivered to them, and :func:`verify_direction_b_decisions`
+    diffs their answers against the recording after replay. This builder only validates
+    that every recorded subtype has a live handler to run — a recording with permission
+    exchanges but no live ``can_use_tool`` (hook exchanges but no live ``hooks``,
+    ``mcp_message`` exchanges but no matching in-process SDK MCP server) is itself
     divergence from the recorded session, surfaced up front with a clear message
     rather than as N swallowed "callback is not provided" errors.
 
-    Fail-closed on unsupported subtypes exactly like stub mode (``mcp_message`` —
-    its responses embed environment-dependent payloads; see the tracker).
+    Fail-closed on unsupported subtypes exactly like stub mode.
     """
     exchanges = direction_b_exchanges(tape)
     unsupported = set(exchanges) - SUPPORTED_SUBTYPES
@@ -458,6 +592,27 @@ def control_verify_options(
                 "recording (use mode='stub' to replay the recorded outputs instead)"
             )
         keep.add("hook_callback")
+    if exchanges.get("mcp_message"):
+        recorded_servers = {
+            name
+            for ex in exchanges["mcp_message"]
+            if isinstance(name := ex.request.get("server_name"), str)
+        }
+        configured = options.mcp_servers if isinstance(options.mcp_servers, dict) else {}
+        live_sdk_servers = {
+            name
+            for name, config in configured.items()
+            if isinstance(config, dict) and config.get("type") == "sdk"
+        }
+        missing = recorded_servers - live_sdk_servers
+        if missing:
+            raise CassetteMismatchError(
+                f"tape records mcp_message exchanges for SDK MCP server(s) {sorted(missing)} "
+                "but options.mcp_servers has no such in-process server — mode='verify' runs "
+                "YOUR server's tools and diffs their results against the recording (use "
+                "mode='stub' to replay the recorded results instead)"
+            )
+        keep.add("mcp_message")
     return ControlStubBundle(options=options, keep_subtypes=keep, ledger=ControlReplayLedger())
 
 

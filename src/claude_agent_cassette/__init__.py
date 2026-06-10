@@ -29,6 +29,7 @@ from .tape import (
 from .control_stubs import (
     ControlReplayLedger,
     ControlStubBundle,
+    build_mcp_stub_servers,
     control_stub_options,
     control_verify_options,
     direction_b_replay_findings,
@@ -65,6 +66,7 @@ __all__ = [
     "control_stub_options",
     "control_verify_options",
     "verify_direction_b_decisions",
+    "build_mcp_stub_servers",
     "ControlStubBundle",
     "ControlReplayLedger",
     "direction_b_replay_findings",
