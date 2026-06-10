@@ -19,9 +19,11 @@ match (or more requests than recorded) is **fail-closed**:
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Any, Awaitable, Callable
 
 from claude_agent_sdk import (
+    ClaudeAgentOptions,
     PermissionResultAllow,
     PermissionResultDeny,
     ToolPermissionContext,
@@ -98,3 +100,28 @@ def build_permission_stub(tape: list[TapeEntry]) -> CanUseTool:
         )
 
     return can_use_tool
+
+
+def control_stub_options(
+    tape: list[TapeEntry], base_options: ClaudeAgentOptions | None = None
+) -> tuple[ClaudeAgentOptions, set[str]]:
+    """Wire Direction-B replay stubs for the subtypes a tape actually contains.
+
+    Returns ``(options, keep_subtypes)``: a copy of ``base_options`` with a replay
+    stub installed for every *supported* Direction-B subtype present in the tape, and
+    the set of those subtypes — so the caller keeps exactly the ``control_request``s
+    it can answer (via :meth:`ReplayTransport.from_tape`) and drops the rest as inert.
+
+    Only ``can_use_tool`` is supported today; ``hook_callback`` / ``mcp_message``
+    will join here as their stub builders land. A stub is installed only when the
+    tape has that subtype, so this never clobbers a consumer callback for a subtype
+    the recording never exercised. :func:`~claude_agent_cassette.replay_tape` calls
+    this; advanced callers can use it to wire the transport and options by hand.
+    """
+    options = base_options or ClaudeAgentOptions()
+    keep: set[str] = set()
+    exchanges = direction_b_exchanges(tape)
+    if exchanges.get("can_use_tool"):
+        options = dataclasses.replace(options, can_use_tool=build_permission_stub(tape))
+        keep.add("can_use_tool")
+    return options, keep

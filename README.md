@@ -38,7 +38,11 @@ from claude_agent_cassette import replay, load_cassette
 
 async def test_my_handler():
     async with replay(load_cassette("tests/cassettes/happy_path.jsonl")) as client:
-        kinds = [type(m).__name__ async for m in client.receive_messages()]
+        kinds = []
+        async for m in client.receive_messages():
+            kinds.append(type(m).__name__)
+            if kinds[-1] == "ResultMessage":
+                break  # stream stays open after the result; break like the real wire
         assert "ResultMessage" in kinds
         # ...or feed client.receive_messages() into your own dispatcher and
         #    assert on what it produces.

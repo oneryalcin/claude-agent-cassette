@@ -9,6 +9,7 @@ without yet needing the ``from_tape`` Direction-B wiring (piece 4).
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 
 import pytest
@@ -23,9 +24,11 @@ from claude_agent_cassette import (
     CassetteMismatchError,
     ReplayTransport,
     build_permission_stub,
+    control_stub_options,
     direction_b_exchanges,
     direction_b_read_frames,
     load_tape,
+    replay_tape,
 )
 
 _PERMISSION = Path(__file__).parent.parent / "examples" / "cassettes" / "permission_session.jsonl"
@@ -112,3 +115,95 @@ async def test_stub_drives_real_client_end_to_end():
     assert types[-1] == "ResultMessage"
     # the recorded can_use_tool requests were answered, in order, from the tape
     assert fired == [("Write", "PermissionResultAllow"), ("Write", "PermissionResultDeny")]
+
+
+# --- Piece 4: control_stub_options + replay_tape wiring ---
+
+
+def test_control_stub_options_installs_permission_stub_without_mutating_base():
+    base = ClaudeAgentOptions(can_use_tool=None)
+    options, keep = control_stub_options(_tape(), base)
+    assert keep == {"can_use_tool"}
+    assert options.can_use_tool is not None       # stub installed on the copy
+    assert base.can_use_tool is None              # base untouched
+    assert options is not base
+
+
+def test_control_stub_options_no_op_when_subtype_absent():
+    # the websearch tape has no can_use_tool -> nothing to stub, nothing to keep
+    websearch = load_tape(Path(__file__).parent / "fixtures" / "websearch_control_tape.jsonl")
+    base = ClaudeAgentOptions()
+    options, keep = control_stub_options(websearch, base)
+    assert keep == set()
+    assert options.can_use_tool is base.can_use_tool  # left as-is
+
+
+def _permission_responses(writes: list[str]) -> list[dict]:
+    """The permission decisions the SDK wrote back (control_responses carrying behavior)."""
+    out = []
+    for data in writes:
+        try:
+            frame = json.loads(data)
+        except ValueError:
+            continue
+        if frame.get("type") == "control_response":
+            decision = (frame.get("response") or {}).get("response") or {}
+            if "behavior" in decision:
+                out.append(decision)
+    return out
+
+
+async def _drive_to_result(client: ClaudeSDKClient) -> None:
+    await client.connect()
+    async for message in client.receive_messages():
+        if type(message).__name__ == "ResultMessage":
+            break
+    await client.disconnect()
+
+
+async def test_direction_b_mode_delivers_requests_inert_mode_drops_them():
+    """The behavioral difference: in Direction-B mode the SDK receives the recorded
+    can_use_tool requests and the stub answers them (so the SDK writes control_responses
+    carrying the decision); inert mode drops the requests, so no such writes occur."""
+    tape = _tape()
+
+    options, keep = control_stub_options(tape)
+    transport = ReplayTransport.from_tape(tape, keep_control_requests=keep)
+    await asyncio.wait_for(_drive_to_result(ClaudeSDKClient(options=options, transport=transport)), _TIMEOUT_S)
+    assert [d["behavior"] for d in _permission_responses(transport.writes)] == ["allow", "deny"]
+
+    inert = ReplayTransport.from_tape(tape)  # default: Direction-B dropped
+    await asyncio.wait_for(_drive_to_result(ClaudeSDKClient(options=ClaudeAgentOptions(), transport=inert)), _TIMEOUT_S)
+    assert _permission_responses(inert.writes) == []
+
+
+async def test_replay_tape_control_true_replays_to_result():
+    async def drive():
+        async with replay_tape(_tape(), control=True) as client:
+            types = []
+            async for message in client.receive_messages():
+                types.append(type(message).__name__)
+                if types[-1] == "ResultMessage":
+                    break
+            return types
+    types = await asyncio.wait_for(drive(), _TIMEOUT_S)
+    assert types[-1] == "ResultMessage"
+
+
+async def test_replay_tape_control_false_leaves_consumer_callback_inert():
+    fired: list[str] = []
+
+    async def consumer(tool_name, tool_input, context):
+        fired.append(tool_name)
+        return PermissionResultAllow()
+
+    async def drive():
+        async with replay_tape(
+            _tape(), options=ClaudeAgentOptions(can_use_tool=consumer), control=False
+        ) as client:
+            async for message in client.receive_messages():
+                if type(message).__name__ == "ResultMessage":
+                    break
+
+    await asyncio.wait_for(drive(), _TIMEOUT_S)
+    assert fired == []  # Direction-B dropped -> the consumer's callback is never consulted

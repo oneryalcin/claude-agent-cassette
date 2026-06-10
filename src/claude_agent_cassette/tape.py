@@ -189,7 +189,9 @@ def direction_b_exchanges(tape: list[TapeEntry]) -> dict[str, deque[ControlExcha
     return dict(by_subtype)
 
 
-def direction_b_read_frames(tape: list[TapeEntry]) -> list[RawMessage]:
+def direction_b_read_frames(
+    tape: list[TapeEntry], keep_subtypes: set[str] | None = None
+) -> list[RawMessage]:
     """Inbound frames to feed the SDK for a **Direction-B** replay.
 
     Conversation/system frames PLUS the inbound Direction-B ``control_request``s
@@ -198,13 +200,28 @@ def direction_b_read_frames(tape: list[TapeEntry]) -> list[RawMessage]:
     frames are dropped: those are Direction-A answers the transport delivers
     out-of-band (the handshake / control machinery), not through the message stream.
 
-    Contrast :func:`replayable_messages`, which drops **all** control frames for
-    inert, conversation-only replay (today's default ``from_tape`` behaviour). This
-    view is the opt-in Direction-B counterpart: pair it with stub callbacks built
-    from :func:`direction_b_exchanges` so the kept requests resolve to the recorded
-    decisions instead of running the consumer's live logic.
+    ``keep_subtypes`` selects *which* control_request subtypes to keep: ``None``
+    (default) keeps every one; a set keeps only those subtypes and drops the rest, so
+    a Direction-B subtype with no replay stub stays inert (dropped, exactly as in
+    conversation-only replay) instead of reaching an unstubbed live callback.
+
+    Contrast :func:`replayable_messages`, which drops **all** control frames. Pair
+    this with stub callbacks built from :func:`direction_b_exchanges` so the kept
+    requests resolve to the recorded decisions instead of running live logic.
     """
-    return [f for f in read_frames(tape) if f.get("type") != "control_response"]
+    frames: list[RawMessage] = []
+    for frame in read_frames(tape):
+        frame_type = frame.get("type")
+        if frame_type == "control_response":
+            continue
+        if (
+            frame_type == "control_request"
+            and keep_subtypes is not None
+            and control_request_subtype(frame) not in keep_subtypes
+        ):
+            continue
+        frames.append(frame)
+    return frames
 
 
 def conversation_messages(tape: list[TapeEntry]) -> list[RawMessage]:

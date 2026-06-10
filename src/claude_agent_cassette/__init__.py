@@ -7,7 +7,7 @@ bug that mocked tests can't.
 """
 
 from .record import record_sdk_wire
-from .replay import replay
+from .replay import replay, replay_tape
 from .tape import (
     ControlExchange,
     Direction,
@@ -25,7 +25,7 @@ from .tape import (
     replayable_messages,
     serialize_tape,
 )
-from .control_stubs import build_permission_stub
+from .control_stubs import build_permission_stub, control_stub_options
 from .drift import DriftFinding, check_tape, parse_drift
 from .transport import CassetteMismatchError, RecordingTransport, ReplayTransport
 
@@ -53,6 +53,8 @@ __all__ = [
     "direction_b_read_frames",
     "ControlExchange",
     "build_permission_stub",
+    "control_stub_options",
+    "replay_tape",
     "parse_drift",
     "check_tape",
     "DriftFinding",

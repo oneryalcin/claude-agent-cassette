@@ -25,6 +25,7 @@ from .tape import (
     TapeEntry,
     control_request_subtype,
     control_responses_by_subtype,
+    direction_b_read_frames,
     replayable_messages,
 )
 
@@ -117,14 +118,31 @@ class ReplayTransport(Transport):
         self.writes: list[str] = []
 
     @classmethod
-    def from_tape(cls, tape: list[TapeEntry]) -> ReplayTransport:
+    def from_tape(
+        cls, tape: list[TapeEntry], keep_control_requests: set[str] | None = None
+    ) -> ReplayTransport:
         """Build a control-aware replay from a full duplex tape.
 
         A thin assembler over the tape's control-protocol view: the conversation
-        to stream (:func:`replayable_messages`) and the recorded Direction-A
-        answers keyed by request subtype (:func:`control_responses_by_subtype`).
+        to stream and the recorded Direction-A answers keyed by request subtype
+        (:func:`control_responses_by_subtype`).
+
+        ``keep_control_requests`` selects the inbound-stream view:
+
+        - ``None`` (default) — conversation only (:func:`replayable_messages`):
+          Direction-B ``control_request``s are dropped so a consumer's registered
+          callbacks stay **inert** on replay.
+        - a set of subtypes — **Direction-B mode**: those ``control_request``s are
+          kept (:func:`direction_b_read_frames`) so the SDK receives them and
+          invokes its callbacks. The caller must install matching stubs (see
+          :func:`~claude_agent_cassette.replay_tape`, which wires both), or those
+          live callbacks will run.
         """
-        return cls(replayable_messages(tape), control_responses_by_subtype(tape))
+        if keep_control_requests is None:
+            messages = replayable_messages(tape)
+        else:
+            messages = direction_b_read_frames(tape, keep_subtypes=keep_control_requests)
+        return cls(messages, control_responses_by_subtype(tape))
 
     async def connect(self) -> None:
         self._ready = True
