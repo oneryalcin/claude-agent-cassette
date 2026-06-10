@@ -138,9 +138,15 @@ def test_control_stub_options_installs_stub_and_clears_prompt_tool_name():
 
 
 def test_control_stub_options_fails_closed_on_unsupported_subtype():
-    # websearch carries mcp_message, which has no stub builder yet -> raise, not silent.
-    with pytest.raises(CassetteMismatchError, match="mcp_message"):
-        control_stub_options(load_tape(_WEBSEARCH))
+    # A Direction-B subtype a future SDK adds has no stub builder -> raise, not silent.
+    future = [
+        {"dir": "read", "frame": {"type": "control_request", "request_id": "f1",
+                                  "request": {"subtype": "telepathy"}}},
+        {"dir": "write", "data": json.dumps({"type": "control_response", "response": {
+            "subtype": "success", "request_id": "f1", "response": {}}})},
+    ]
+    with pytest.raises(CassetteMismatchError, match="telepathy"):
+        control_stub_options(future)
 
 
 # --- direction_b_replay_findings: lint a tape for replayability ---
@@ -151,9 +157,9 @@ def test_replay_findings_empty_for_replayable_fixtures():
     assert direction_b_replay_findings(_hooks()) == []
 
 
-def test_replay_findings_flag_unsupported_and_scrubbed():
+def test_replay_findings_flag_scrubbed_decisions_not_supported_subtypes():
     findings = direction_b_replay_findings(load_tape(_WEBSEARCH))
-    assert any("mcp_message" in f for f in findings)  # unsupported subtype
+    assert not any("not yet replayable" in f for f in findings)  # all 3 subtypes supported now
     assert any("scrubbed" in f for f in findings)  # decisions/ids scrubbed away
 
 

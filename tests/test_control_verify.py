@@ -141,8 +141,15 @@ def test_verify_requires_hooks():
 
 
 def test_verify_fails_closed_on_unsupported_subtype():
-    with pytest.raises(CassetteMismatchError, match="mcp_message"):
-        control_verify_options(load_tape(_WEBSEARCH), ClaudeAgentOptions())
+    # A Direction-B subtype a future SDK adds is not verifiable -> raise, not silent.
+    future = [
+        {"dir": "read", "frame": {"type": "control_request", "request_id": "f1",
+                                  "request": {"subtype": "telepathy"}}},
+        {"dir": "write", "data": json.dumps({"type": "control_response", "response": {
+            "subtype": "success", "request_id": "f1", "response": {}}})},
+    ]
+    with pytest.raises(CassetteMismatchError, match="telepathy"):
+        control_verify_options(future, ClaudeAgentOptions())
 
 
 async def test_verify_tape_without_direction_b_needs_no_callbacks():
