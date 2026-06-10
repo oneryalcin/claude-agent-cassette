@@ -25,7 +25,9 @@ item has a tracking issue; shipped items reference the issue that tracked them.
   exceptions mid-replay, so divergence is surfaced on context exit).
 - **Decision-preserving scrub** — `scrub_tape` blanks PII *values* while keeping
   frame structure and control decisions intact; `lint_tape` checks a (scrubbed)
-  tape is still Direction-B replayable.
+  tape is still Direction-B replayable. `scrub_init_inventory` blanks the
+  `system/init` environment inventory (#22); every example recorder isolates
+  `CLAUDE_CONFIG_DIR`, so the committed fixtures carry no operator fingerprint.
 - **Drift detection** (#3) — re-parse a tape's message frames through the
   *installed* SDK's `message_parser`; flags `parse_error`, `unrecognized_type`,
   and `content_dropped`. CLI gate for SDK-bump PRs (`claude-agent-cassette

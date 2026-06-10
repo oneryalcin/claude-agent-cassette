@@ -20,13 +20,18 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import tempfile
 from pathlib import Path
 
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
 
-from claude_agent_cassette import record, save_tape, scrub_tape
+from claude_agent_cassette import (
+    default_replacements,
+    record,
+    save_tape,
+    scrub_init_inventory,
+    scrub_tape,
+)
 
 _OUT = Path(__file__).parent / "cassettes" / "stop_session.jsonl"
 # Pin a non-Covered (zero-data-retention-OK) model: the default rotated to Fable 5,
@@ -42,19 +47,6 @@ _PROMPT = (
 # Interrupt after this many stream_event deltas — far enough in that generation
 # is demonstrably underway, early enough that the tape stays small.
 _EVENTS_BEFORE_INTERRUPT = 5
-
-
-def _pii_replacements() -> list[tuple[str, str]]:
-    """The (needle, mask) pairs that blank this recording's filesystem fingerprint."""
-    replacements = [
-        (os.path.realpath(os.getcwd()), "<CWD>"),
-        (os.getcwd(), "<CWD>"),
-        (os.path.expanduser("~"), "<HOME>"),
-    ]
-    key = os.environ.get("ANTHROPIC_API_KEY")
-    if key:
-        replacements.append((key, "<REDACTED_API_KEY>"))
-    return replacements
 
 
 def _summary(scrubbed: list[dict]) -> None:
@@ -96,29 +88,33 @@ async def main() -> None:
     # recorded system/init inventory (slash commands, plugins, skills, MCP servers,
     # hooks) is the CLI's builtin baseline, not this machine's fingerprint.
     config_dir = tempfile.mkdtemp(prefix="cassette-clean-config-")
-    options = ClaudeAgentOptions(
-        model=_MODEL,
-        include_partial_messages=True,
-        env={"CLAUDE_CONFIG_DIR": config_dir},
-    )
-    print("Recording stop session ...\n")
-    with record() as tape:
-        async with ClaudeSDKClient(options) as client:
-            await client.query(_PROMPT)
-            events = 0
-            interrupted = False
-            async for message in client.receive_messages():
-                name = type(message).__name__
-                if name == "StreamEvent":
-                    events += 1
-                    if events >= _EVENTS_BEFORE_INTERRUPT and not interrupted:
-                        interrupted = True
-                        print(f"... interrupting after {events} stream events")
-                        await client.interrupt()
-                if name == "ResultMessage":
-                    break
+    with tempfile.TemporaryDirectory() as cwd:
+        options = ClaudeAgentOptions(
+            model=_MODEL,
+            include_partial_messages=True,
+            cwd=cwd,  # never the operator's project dir (it rides the wire slug-encoded)
+            env={"CLAUDE_CONFIG_DIR": config_dir},
+        )
+        print("Recording stop session ...\n")
+        with record() as tape:
+            async with ClaudeSDKClient(options) as client:
+                await client.query(_PROMPT)
+                events = 0
+                interrupted = False
+                async for message in client.receive_messages():
+                    name = type(message).__name__
+                    if name == "StreamEvent":
+                        events += 1
+                        if events >= _EVENTS_BEFORE_INTERRUPT and not interrupted:
+                            interrupted = True
+                            print(f"... interrupting after {events} stream events")
+                            await client.interrupt()
+                    if name == "ResultMessage":
+                        break
 
-    scrubbed = scrub_tape(tape, _pii_replacements())
+        scrubbed = scrub_init_inventory(
+            scrub_tape(tape, default_replacements(cwd=cwd, config_dir=config_dir, username=True))
+        )
     save_tape(scrubbed, _OUT)
     print(f"\nWrote {len(scrubbed)} frames -> {_OUT}")
     _summary(scrubbed)

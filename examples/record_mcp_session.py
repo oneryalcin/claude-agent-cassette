@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -32,7 +32,13 @@ from claude_agent_sdk import (
     tool,
 )
 
-from claude_agent_cassette import record, save_tape, scrub_tape
+from claude_agent_cassette import (
+    default_replacements,
+    record,
+    save_tape,
+    scrub_init_inventory,
+    scrub_tape,
+)
 
 _OUT = Path(__file__).parent / "cassettes" / "mcp_session.jsonl"
 # Pin a non-Covered (zero-data-retention-OK) model: the default rotated to Fable 5,
@@ -63,19 +69,6 @@ async def divide_numbers(args: dict[str, Any]) -> dict[str, Any]:
         }
     result = args["a"] / args["b"]
     return {"content": [{"type": "text", "text": f"{args['a']} / {args['b']} = {result}"}]}
-
-
-def _pii_replacements() -> list[tuple[str, str]]:
-    """The (needle, mask) pairs that blank this recording's filesystem fingerprint."""
-    replacements = [
-        (os.path.realpath(os.getcwd()), "<CWD>"),
-        (os.getcwd(), "<CWD>"),
-        (os.path.expanduser("~"), "<HOME>"),
-    ]
-    key = os.environ.get("ANTHROPIC_API_KEY")
-    if key:
-        replacements.append((key, "<REDACTED_API_KEY>"))
-    return replacements
 
 
 def _summary(scrubbed: list[dict]) -> None:
@@ -110,21 +103,30 @@ async def main() -> None:
     calculator = create_sdk_mcp_server(
         name="calculator", version="1.0.0", tools=[add_numbers, divide_numbers]
     )
-    options = ClaudeAgentOptions(
-        mcp_servers={"calc": calculator},
-        # Pre-approve the tools so the tape stays mcp_message-only (no can_use_tool).
-        allowed_tools=["mcp__calc__add", "mcp__calc__divide"],
-        model=_MODEL,
-    )
-    print("Recording mcp session ...\n")
-    with record() as tape:
-        async with ClaudeSDKClient(options) as client:
-            await client.query(_PROMPT)
-            async for message in client.receive_response():
-                if type(message).__name__ == "ResultMessage":
-                    break
+    # Isolate the CLI from the operator's ~/.claude: a fresh config dir means the
+    # recorded system/init inventory (slash commands, plugins, skills, MCP servers,
+    # hooks) is the CLI's builtin baseline, not this machine's fingerprint.
+    config_dir = tempfile.mkdtemp(prefix="cassette-clean-config-")
+    with tempfile.TemporaryDirectory() as cwd:
+        options = ClaudeAgentOptions(
+            mcp_servers={"calc": calculator},
+            # Pre-approve the tools so the tape stays mcp_message-only (no can_use_tool).
+            allowed_tools=["mcp__calc__add", "mcp__calc__divide"],
+            model=_MODEL,
+            cwd=cwd,  # never the operator's project dir (it rides the wire slug-encoded)
+            env={"CLAUDE_CONFIG_DIR": config_dir},
+        )
+        print("Recording mcp session ...\n")
+        with record() as tape:
+            async with ClaudeSDKClient(options) as client:
+                await client.query(_PROMPT)
+                async for message in client.receive_response():
+                    if type(message).__name__ == "ResultMessage":
+                        break
 
-    scrubbed = scrub_tape(tape, _pii_replacements())
+        scrubbed = scrub_init_inventory(
+            scrub_tape(tape, default_replacements(cwd=cwd, config_dir=config_dir, username=True))
+        )
     _OUT.parent.mkdir(parents=True, exist_ok=True)
     save_tape(scrubbed, _OUT)
     print(f"\nWrote {len(scrubbed)} frames -> {_OUT}")

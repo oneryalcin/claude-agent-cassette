@@ -44,7 +44,13 @@ from claude_agent_sdk import (
     ToolPermissionContext,
 )
 
-from claude_agent_cassette import record, save_tape, scrub_tape
+from claude_agent_cassette import (
+    default_replacements,
+    record,
+    save_tape,
+    scrub_init_inventory,
+    scrub_tape,
+)
 
 _OUT = Path(__file__).parent / "cassettes" / "permission_session.jsonl"
 # Pin a non-Covered (zero-data-retention-OK) model: the default rotated to Fable 5,
@@ -103,19 +109,6 @@ async def deterministic_permission(
     return PermissionResultDeny(message=f"Tool not permitted in recording: {tool_name}")
 
 
-def _pii_replacements(cwd: str) -> list[tuple[str, str]]:
-    """The (needle, mask) pairs that blank this recording's filesystem fingerprint."""
-    replacements = [
-        (os.path.realpath(cwd), "<CWD>"),
-        (cwd, "<CWD>"),
-        (os.path.expanduser("~"), "<HOME>"),
-    ]
-    key = os.environ.get("ANTHROPIC_API_KEY")
-    if key:
-        replacements.append((key, "<REDACTED_API_KEY>"))
-    return replacements
-
-
 def _summary(scrubbed: list[dict]) -> None:
     """Print the Direction-B can_use_tool exchanges recorded, with their (kept) decisions."""
     resp_by_id: dict[str, Any] = {}
@@ -143,12 +136,17 @@ def _summary(scrubbed: list[dict]) -> None:
 
 
 async def main() -> None:
+    # Isolate the CLI from the operator's ~/.claude: a fresh config dir means the
+    # recorded system/init inventory (slash commands, plugins, skills, MCP servers,
+    # hooks) is the CLI's builtin baseline, not this machine's fingerprint.
+    config_dir = tempfile.mkdtemp(prefix="cassette-clean-config-")
     with tempfile.TemporaryDirectory() as cwd:
         options = ClaudeAgentOptions(
             can_use_tool=deterministic_permission,
             permission_mode="default",  # ensures the callback is consulted
             cwd=cwd,
             model=_MODEL,
+            env={"CLAUDE_CONFIG_DIR": config_dir},
         )
         print(f"Recording permission session in {cwd} ...\n")
         with record() as tape:
@@ -158,7 +156,9 @@ async def main() -> None:
                     if type(message).__name__ == "ResultMessage":
                         break
 
-        scrubbed = scrub_tape(tape, _pii_replacements(cwd))
+        scrubbed = scrub_init_inventory(
+            scrub_tape(tape, default_replacements(cwd=cwd, config_dir=config_dir, username=True))
+        )
         _OUT.parent.mkdir(parents=True, exist_ok=True)
         save_tape(scrubbed, _OUT)
         print(f"\nWrote {len(scrubbed)} frames -> {_OUT}")

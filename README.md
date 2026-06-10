@@ -186,6 +186,16 @@ async def test_permission_flow():
   replacements)` blanks PII *values* while keeping decisions intact; `lint_tape(tape)`
   lints whether a tape is still replayable (run it after scrubbing). See
   [`examples/record_permission_session.py`](examples/record_permission_session.py).
+- **The recording environment is a leak of its own**: the CLI enumerates it twice —
+  the `system/init` frame and the `initialize` handshake response (slash commands,
+  plugins with paths, skills, agents, MCP servers, tools, memory paths, account
+  metadata) — and embeds paths **slug-encoded** (`/Users/alice/proj` rides the wire
+  as `-Users-alice-proj`), which a literal path needle can never match. Best fix:
+  record under an isolated config dir and a temp cwd (as every example recorder
+  does). After-the-fact: `scrub_init_inventory(tape)` blanks both inventories
+  (replay never reads them, so it is decision-preserving by construction), and
+  `default_replacements()` / `path_replacements(path, mask)` produce needles for the
+  raw, realpath, *and* slug forms.
 
 ### Interrupt replay (lockstep)
 
@@ -289,6 +299,8 @@ offline):
 | `inbound_frames(tape)` / `conversation_frames(tape)` | derive frame views from a tape (all inbound / conversation-only) |
 | `direction_b_exchanges(tape)` → `{subtype: [ControlExchange]}` | inspect the recorded Direction-B decisions (what was allowed/denied/answered) |
 | `scrub_tape(tape, replacements)` | decision-preserving PII scrub for sharing a recording |
+| `scrub_init_inventory(tape)` | blank the environment inventory in `system/init` + the `initialize` handshake response |
+| `default_replacements(cwd=…, config_dir=…, username=…)` / `path_replacements(path, mask)` | standard scrub needles — cwd/home/API key (+ a recording session's dirs and username), in raw + realpath + slug-encoded forms |
 | `lint_tape(tape)` | lint a tape for Direction-B replayability (run after scrubbing) |
 | `check_drift(tape)` / `parse_drift(frames)` → `list[DriftFinding]` | drift findings vs the installed SDK |
 | `unmodeled_fields(frames)` / `field_drift(frames, baseline)` | field-level drift: recorded fields the installed SDK silently ignores |
