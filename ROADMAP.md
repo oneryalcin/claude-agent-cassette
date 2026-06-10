@@ -1,76 +1,68 @@
 # Roadmap
 
-Directional, not a promise. Issues/PRs welcome on any of these.
+Directional, not a promise. Issues/PRs welcome on any of these. Every planned
+item has a tracking issue; shipped items reference the issue that tracked them.
 
-## Shipped (v0.1)
+## Shipped (through v0.3.0)
 
 - **Replay** — inject `ReplayTransport` into a real `ClaudeSDKClient`; recorded
   raw frames flow through the SDK's real parser. Answers the `initialize`
   control handshake. No API key, no subprocess.
-- **Record** — `RecordingTransport` (passive MITM tee) + `record()`,
-  which works with both `query()` and `ClaudeSDKClient`. Captures the **full
-  duplex** wire, including the control plane.
-- **Tape format** — ordered, both-directions `TapeEntry` JSONL; serialize/load;
-  `conversation_frames()` to derive a conversation view.
-- Runnable example, tests (replay + record, no key).
+- **Record** — `RecordingTransport` (passive MITM tee) + `record()`, which works
+  with both `query()` and `ClaudeSDKClient`. Captures the **full duplex** wire,
+  including the control plane.
+- **Tape format** — ordered, both-directions `TapeEntry` JSONL; `save_tape` /
+  `load_tape`; `conversation_frames()` to derive the conversation-only view.
+- **Direction-A control replay** (#2) — `ReplayTransport.from_tape`: the recorded
+  `initialize` / `mcp_status` responses replayed, id-remapped to the live
+  request, fail-closed on a request the tape can't answer.
+- **Direction-B replay, all three subtypes** (#2) — `replay_tape(mode="stub")`
+  answers recorded `can_use_tool` / `hook_callback` / `mcp_message` requests from
+  the tape (for MCP: a real in-process server synthesized from the recording);
+  `mode="verify"` runs the consumer's *real* callbacks/servers and diffs each
+  live decision against the recording at the wire, by `request_id`. Both modes
+  fail closed end-to-end via a divergence ledger (the SDK swallows callback
+  exceptions mid-replay, so divergence is surfaced on context exit).
+- **Decision-preserving scrub** — `scrub_tape` blanks PII *values* while keeping
+  frame structure and control decisions intact; `lint_tape` checks a (scrubbed)
+  tape is still Direction-B replayable.
+- **Drift detection** (#3) — re-parse a tape's message frames through the
+  *installed* SDK's `message_parser`; flags `parse_error`, `unrecognized_type`,
+  and `content_dropped`. CLI gate for SDK-bump PRs (`claude-agent-cassette
+  drift`), fail-closed on empty input, flat + nested cassette layouts (#11).
+- **CI matrix across `claude-agent-sdk` versions** (#5) — replay rides the
+  public `Transport` ABC; record/drift touch `_internal` and are
+  version-sensitive, which the matrix trips on early.
+- **PEP 561** `py.typed` (#1); single-sourced version (hatchling dynamic).
 
 ## Planned
 
-### 1. Control-protocol replay
-- **Direction A** (SDK→CLI: `initialize`, `mcp_status`, …) — **shipped**
-  (`ReplayTransport.from_tape`): the recorded response is replayed, id-remapped to the
-  live request.
-- **Direction B** (CLI→SDK: `can_use_tool`, `hook_callback`, `mcp_message`) — **stub
-  replay shipped** for `can_use_tool` + `hook_callback` (`replay_tape(mode="stub")`):
-  the recorded requests are delivered and answered from the tape by stubs, fail-closed
-  end-to-end on divergence.
-- **`verify` mode** — **shipped** (`replay_tape(mode="verify")`): the consumer's *real*
-  `can_use_tool` / `hooks` / SDK MCP servers answer the recorded requests, and each live
-  decision is diffed against the recording at the wire, matched by `request_id` (tests
-  the policy, not just the wire). Fail-closed on a changed decision, a callback that now
-  raises, or an unanswered exchange.
-- **`mcp_message`** — **shipped** for both modes: stub mode synthesizes a *real*
-  in-process MCP server per recorded `server_name` (`build_mcp_stub_servers`) — identity
-  from the recorded `initialize`, tool defs from the recorded `tools/list`, results from
-  the recorded `tools/call`s, FIFO per tool, fail-closed on desync/exhaustion/recorded
-  errors. Verify mode diffs the consumer's real server at the wire (the SDK answers
-  `initialize` / `notifications/initialized` statelessly, so the diff is deterministic).
-  Remaining:
-  - **`interrupt` lockstep** — ordering-sensitive Direction-A control where a conversation
-    frame must land after a control exchange.
+### 1. `interrupt` lockstep ([#7](https://github.com/oneryalcin/claude-agent-cassette/issues/7))
+Ordering-sensitive Direction-A control, where a conversation frame must land
+*after* a control exchange resolves. Also lifts the flow-control constraint on
+issuing control calls while replaying tapes larger than the SDK's inbound buffer.
 
-### 2. pytest integration
-- Cassette discovery + a fixture/marker (`@pytest.mark.cassette("name")`).
-- **Record-on-miss** ergonomics (VCR-style): replay if a cassette exists, else
-  record it on first run.
-- A per-test timeout default so a malformed cassette fails fast instead of hanging.
+### 2. pytest integration ([#4](https://github.com/oneryalcin/claude-agent-cassette/issues/4))
+Cassette discovery + a fixture/marker (`@pytest.mark.cassette("name")`),
+**record-on-miss** ergonomics (VCR-style: replay if a recording exists, record on
+first run), and a per-test timeout default so a malformed recording fails fast
+instead of hanging.
 
-### 3. Drift detection
-- Re-parse a cassette's frames through the *installed* SDK's `message_parser`; a
-  parse failure (or a `None` result for a now-unrecognised type) means the wire
-  shape drifted → re-record. Reuses the SDK's own parser, so it can't disagree
-  with what the SDK actually accepts.
-- A CLI (`claude-agent-cassette drift <dir>`) for SDK-bump PRs: report stale
-  cassettes + `sdk_version` skew.
+### 3. Field-level drift ([#9](https://github.com/oneryalcin/claude-agent-cassette/issues/9))
+Today's drift check is parse-level (rejected/skipped frames + dropped content
+blocks). It does not catch additive drift: a new optional field inside a
+still-recognised block, or a changed-but-tolerated enum value. Needs a
+recorded-expectations / typed-shape diff, not a re-parse.
 
-### 4. Cassette tooling
-- Curation helpers: trim a recorded tape to an essential conversation; CLI to
-  turn a recorded tape into a replayable cassette.
-- **Redaction/scrub helper** — **shipped** (`scrub_tape`): blanks PII *values* while
-  keeping frame structure and control decisions intact. `lint_tape`
-  lints whether a scrubbed tape is still replayable.
+### 4. Cassette curation tooling ([#17](https://github.com/oneryalcin/claude-agent-cassette/issues/17))
+Trim a recorded tape to an essential conversation (dropping whole turns, never
+reshaping kept frames) and a CLI to derive a conversation-only frames file. A
+trimmed tape must stay Direction-B coherent (`lint_tape` passes afterwards).
 
-### 5. Assertion helpers (optional, light)
-- Ordered-subsequence + exhaustive-type matching over emitted messages, so users
-  who want it can assert "these messages, in this order, and no extra X" without
-  hand-rolling it. Kept optional — the library's core is record/replay; you bring
-  your own assertions.
-
-### 6. Compatibility
-- CI matrix across `claude-agent-sdk` versions. **Replay** rides the public
-  `Transport` ABC and is stable; **record** touches `_internal` and is
-  version-sensitive — pin and re-verify on bumps. Track the 0.2.x line; watch for
-  0.3 breaking the `_internal` layout.
+### 5. Assertion helpers ([#18](https://github.com/oneryalcin/claude-agent-cassette/issues/18))
+Ordered-subsequence + exhaustive-type matching over replayed messages, for users
+who want "these messages, in this order, and no extra X" without hand-rolling
+it. Optional and thin — the library's core is record/replay.
 
 ## Non-goals
 
