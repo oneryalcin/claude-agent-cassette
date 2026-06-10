@@ -32,6 +32,9 @@ Homepage = "https://github.com/oneryalcin/claude-agent-cassette"
 [project.scripts]
 claude-agent-cassette = "claude_agent_cassette.cli:main"
 
+[project.entry-points.pytest11]
+claude_agent_cassette = "claude_agent_cassette.pytest_plugin"
+
 [tool.hatch.version]
 path = "src/claude_agent_cassette/__init__.py"
 

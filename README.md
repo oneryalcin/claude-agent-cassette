@@ -172,6 +172,39 @@ async def test_permission_flow():
   lints whether a tape is still replayable (run it after scrubbing). See
   [`examples/record_permission_session.py`](examples/record_permission_session.py).
 
+## pytest plugin (record-on-miss, VCR-style)
+
+Installing the package registers a pytest plugin (inert unless used). One marker
+line per cassette — no loader code:
+
+```python
+import pytest
+
+@pytest.mark.cassette("happy_path", mode="stub")
+async def test_happy_path(cassette):
+    messages = await cassette.run("List the files in this directory")
+    assert type(messages[-1]).__name__ == "ResultMessage"
+    # assertions stay yours — feed `messages` to your own adapter/dispatcher
+```
+
+- **Replay** — if `<test file's dir>/cassettes/happy_path.jsonl` exists, it
+  replays through a real `ClaudeSDKClient` in the marker's `mode` (default
+  `"stub"`; the `prompt` is ignored — the recording already answered it).
+  Without a marker name, the test's name is used.
+- **Record-on-miss** — if it doesn't exist, `pytest --record-cassettes` runs a
+  real session (needs `ANTHROPIC_API_KEY`), scrubs it (cwd/home/API key masked
+  by default — override the `cassette_scrub` fixture to extend), and saves it on
+  success. *Without* the flag, a missing cassette **fails with instructions** —
+  CI can never record or spend money.
+- **Timeout, not hang** — a truncated recording (no terminal `ResultMessage`)
+  fails fast with a clear message instead of hanging the suite
+  (`cassette_timeout` ini, default 30s; per-test `timeout=` on the marker).
+- **`mode="verify"`** — override the `cassette_options` fixture in your conftest
+  to supply real `can_use_tool`/hooks/MCP servers; the replay then diffs your
+  policy's decisions against the recording.
+- Ini options: `cassette_dir` (rootdir-relative; default is `cassettes/` next to
+  the test file), `cassette_timeout`.
+
 ## Examples
 
 [`examples/`](examples/) has a runnable, no-key demo:
@@ -244,8 +277,8 @@ See [ROADMAP.md](ROADMAP.md). Shipped: conversation replay, recording,
 **Direction-A control replay** (`ReplayTransport.from_tape`), **drift detection**,
 **Direction-B replay for all three subtypes** (`can_use_tool` / `hook_callback` /
 `mcp_message`, in both `mode="stub"` and `mode="verify"`), and a
-**decision-preserving scrub** (`scrub_tape`). Next up: `interrupt` lockstep, a pytest
-plugin with record-on-miss, and field-level drift.
+**decision-preserving scrub** (`scrub_tape`), and a **pytest plugin** (marker/fixture,
+record-on-miss, timeout-not-hang). Next up: `interrupt` lockstep and field-level drift.
 
 ## License
 
