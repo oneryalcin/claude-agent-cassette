@@ -224,6 +224,26 @@ def direction_b_read_frames(
     return frames
 
 
+def recorded_hook_config(tape: list[TapeEntry]) -> RawMessage | None:
+    """The hook structure the SDK registered at ``initialize``, or ``None`` if none.
+
+    Read from the recorded outbound ``initialize`` ``control_request``; shape is
+    ``{event: [{"matcher": ..., "hookCallbackIds": ["hook_0", ...]}, ...]}``. A
+    Direction-B hook replay mirrors this so the live SDK re-assigns the *same*
+    ``callback_id``s (it numbers them ``hook_0``, ``hook_1``, … in registration
+    order from a fresh counter), which is what makes the recorded ``hook_callback``
+    requests resolve to the replay stubs.
+    """
+    for entry in tape:
+        payload = _write_payload(entry)
+        if payload is None or payload.get("type") != "control_request":
+            continue
+        request = payload.get("request") or {}
+        if request.get("subtype") == "initialize":
+            return request.get("hooks")
+    return None
+
+
 def conversation_messages(tape: list[TapeEntry]) -> list[RawMessage]:
     """The conversation-only inbound view — derive a replay cassette from a duplex tape.
 
