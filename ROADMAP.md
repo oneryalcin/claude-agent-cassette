@@ -49,11 +49,13 @@ issuing control calls while replaying tapes larger than the SDK's inbound buffer
 records; recordings are scrubbed before disk via the `cassette_scrub` fixture);
 timeout-not-hang on truncated recordings (`cassette_timeout` ini).
 
-### 3. Field-level drift ([#9](https://github.com/oneryalcin/claude-agent-cassette/issues/9))
-Today's drift check is parse-level (rejected/skipped frames + dropped content
-blocks). It does not catch additive drift: a new optional field inside a
-still-recognised block, or a changed-but-tolerated enum value. Needs a
-recorded-expectations / typed-shape diff, not a re-parse.
+### 3. Field-level drift ([#9](https://github.com/oneryalcin/claude-agent-cassette/issues/9)) — **shipped on main**
+`unmodeled_fields(frames)` runs the SDK's real parser over an access-tracking
+view of each frame: anything neither read nor retained in the typed message is a
+recorded field the installed SDK silently ignores — the parser itself is the
+schema, so nothing rots. `field_drift(frames, baseline)` gates against a
+committed baseline (steady-state ignored fields are facts, not drift); CLI:
+`drift --fields` / `--update-field-baselines`, fail-closed on missing baselines.
 
 ### 4. Cassette curation tooling ([#17](https://github.com/oneryalcin/claude-agent-cassette/issues/17))
 Trim a recorded tape to an essential conversation (dropping whole turns, never

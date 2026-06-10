@@ -28,7 +28,14 @@ from .tape import (
 )
 from .direction_b import lint_tape
 from .scrub import Replacements, scrub_tape
-from .drift import DriftFinding, DriftReason, check_drift, parse_drift
+from .drift import (
+    DriftFinding,
+    DriftReason,
+    check_drift,
+    field_drift,
+    parse_drift,
+    unmodeled_fields,
+)
 from .transport import CassetteMismatchError, RecordingTransport, ReplayTransport
 
 __version__ = "0.3.0"
@@ -55,6 +62,8 @@ __all__ = [
     # replayability (is it still Direction-B replayable after a scrub?)
     "check_drift",
     "parse_drift",
+    "unmodeled_fields",
+    "field_drift",
     "DriftFinding",
     "DriftReason",
     "lint_tape",
