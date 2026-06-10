@@ -10,7 +10,7 @@ from .transport import RecordingTransport
 
 
 @contextmanager
-def record_sdk_wire() -> Iterator[list[TapeEntry]]:
+def record() -> Iterator[list[TapeEntry]]:
     """Tee the SDK wire for any query run inside the ``with`` block.
 
     Yields the tape (a growing list of :class:`TapeEntry`); on exit the SDK's
@@ -19,12 +19,12 @@ def record_sdk_wire() -> Iterator[list[TapeEntry]]:
 
     Usage::
 
-        from claude_agent_cassette import record_sdk_wire, serialize_tape
+        from claude_agent_cassette import record, save_tape
 
-        with record_sdk_wire() as tape:
+        with record() as tape:
             async for _ in query(prompt="...", options=...):
                 pass
-        Path("session.jsonl").write_text(serialize_tape(tape))
+        save_tape(tape, "session.jsonl")
 
     Patches BOTH transport reference sites, because the SDK reaches the transport
     two ways: ``ClaudeSDKClient._connect_inner`` (the interactive client) does a

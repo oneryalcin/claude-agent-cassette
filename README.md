@@ -34,10 +34,10 @@ pip install claude-agent-cassette   # (or: uv add claude-agent-cassette)
 ## Replay (the common case — offline, no key)
 
 ```python
-from claude_agent_cassette import replay, load_cassette
+from claude_agent_cassette import replay, load_frames
 
 async def test_my_handler():
-    async with replay(load_cassette("tests/cassettes/happy_path.jsonl")) as client:
+    async with replay(load_frames("tests/cassettes/happy_path.jsonl")) as client:
         kinds = []
         async for m in client.receive_messages():
             kinds.append(type(m).__name__)
@@ -48,46 +48,47 @@ async def test_my_handler():
         #    assert on what it produces.
 ```
 
-A **cassette** is a JSONL file of raw inbound stream-json frames — the exact dicts
-the CLI emits. `replay()` injects them into a real `ClaudeSDKClient` and answers
-the SDK's `initialize` control handshake for you.
+A frames file is JSONL of raw inbound stream-json frames — the exact dicts the
+CLI emits. `replay()` injects them into a real `ClaudeSDKClient` and answers the
+SDK's `initialize` control handshake for you. (Vocabulary: a **frame** is a raw
+wire dict; a **message** is the typed object the SDK parses it into; a **tape**
+is a full duplex recording.)
 
 ## Record (capture a real session)
 
-`record_sdk_wire()` works with **both** SDK entry points — the one-shot `query()`
+`record()` works with **both** SDK entry points — the one-shot `query()`
 and the interactive `ClaudeSDKClient` (it patches both transport-construction
 sites the SDK uses):
 
 ```python
-from pathlib import Path
-from claude_agent_cassette import record_sdk_wire, serialize_tape
+from claude_agent_cassette import record, save_tape
 
 # one-shot query()
 from claude_agent_sdk import query
 
-with record_sdk_wire() as tape:                  # tees the full duplex wire
+with record() as tape:                  # tees the full duplex wire
     async for _ in query(prompt="...", options=...):
         pass
-Path("session.jsonl").write_text(serialize_tape(tape))
+save_tape(tape, "session.jsonl")
 ```
 
 ```python
 # interactive ClaudeSDKClient
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
 
-with record_sdk_wire() as tape:
+with record() as tape:
     async with ClaudeSDKClient(options=ClaudeAgentOptions()) as client:
         await client.query("...")
         async for _ in client.receive_messages():
             pass
-Path("session.jsonl").write_text(serialize_tape(tape))
+save_tape(tape, "session.jsonl")
 ```
 
-`record_sdk_wire()` captures **both directions, including the control plane**
+`record()` captures **both directions, including the control plane**
 (`control_request`/`control_response`, `mcp_message`, `hook_callback`, the
 handshake), so one recording can feed both conversation replay and
-control-protocol replay. Derive a conversation cassette with
-`conversation_messages(tape)`.
+control-protocol replay. Derive the conversation-only frames with
+`conversation_frames(tape)`.
 
 ## Drift detection (gate SDK bumps)
 
@@ -126,7 +127,7 @@ drift: 5 cassette(s) vs claude-agent-sdk 0.2.87
   blocks. It does **not** catch additive *field-level* drift (a still-parsing frame
   that gained a field) — see [ROADMAP.md](ROADMAP.md).
 
-In Python: `parse_drift(frames)` / `check_tape(tape)` → `list[DriftFinding]`.
+In Python: `parse_drift(frames)` / `check_drift(tape)` → `list[DriftFinding]`.
 
 ## Control-protocol replay (the duplex wire)
 
@@ -167,7 +168,7 @@ async def test_permission_flow():
   collected and surfaced on exit, not inside the callback.) A Direction-B subtype with
   no replay support (one a future SDK adds) raises up front — use `mode="inert"`.
 - **Recording** a Direction-B tape needs the control decisions preserved. `scrub_tape(tape,
-  replacements)` blanks PII *values* while keeping decisions intact; `direction_b_replay_findings(tape)`
+  replacements)` blanks PII *values* while keeping decisions intact; `lint_tape(tape)`
   lints whether a tape is still replayable (run it after scrubbing). See
   [`examples/record_permission_session.py`](examples/record_permission_session.py).
 
@@ -190,19 +191,20 @@ see above.)
 
 | | |
 | --- | --- |
-| `replay(messages, options=None)` | async CM → a connected `ClaudeSDKClient` over a `ReplayTransport` (conversation cassette) |
-| `replay_tape(tape, options=None, mode="inert"\|"stub"\|"verify")` | async CM → replay a full duplex tape incl. the control plane |
-| `ReplayTransport(messages)` / `.from_tape(tape, keep_control_requests=None)` | raw frames → real parser (answers the initialize handshake) |
-| `RecordingTransport(inner, tape)` | passive MITM tee, both directions |
-| `record_sdk_wire()` | CM that wraps the SDK's transport to capture a query's wire |
-| `serialize_tape` / `load_tape` / `load_cassette` | tape & cassette I/O |
-| `read_frames(tape)` / `conversation_messages(tape)` | derive replay views from a tape |
-| `control_stub_options(tape, base=None)` → `ControlStubBundle` | wire Direction-B stubs + keep-set + divergence ledger by hand |
-| `control_verify_options(tape, base=None)` / `verify_direction_b_decisions(writes, tape, ledger)` | wire a Direction-B verify replay by hand |
-| `build_mcp_stub_servers(tape, ledger)` | synthesize in-process MCP servers that replay recorded `mcp_message` traffic |
+| `record()` | CM that wraps the SDK's transport to capture a session's full duplex wire as a tape |
+| `replay(frames, options=None)` | async CM → a connected `ClaudeSDKClient` replaying raw frames |
+| `replay_tape(tape, options=None, mode=...)` | async CM → replay a full duplex tape incl. the control plane; `ReplayMode = "inert" \| "stub" \| "verify"` |
+| `save_tape(tape, path)` / `load_tape(path)` | tape I/O (JSONL) |
+| `load_frames(path)` | load a frames file for `replay()` |
+| `inbound_frames(tape)` / `conversation_frames(tape)` | derive frame views from a tape (all inbound / conversation-only) |
+| `direction_b_exchanges(tape)` → `{subtype: [ControlExchange]}` | inspect the recorded Direction-B decisions (what was allowed/denied/answered) |
 | `scrub_tape(tape, replacements)` | decision-preserving PII scrub for sharing a recording |
-| `direction_b_replay_findings(tape)` | lint a tape for Direction-B replayability |
-| `parse_drift(frames)` / `check_tape(tape)` | drift findings vs the installed SDK |
+| `lint_tape(tape)` | lint a tape for Direction-B replayability (run after scrubbing) |
+| `check_drift(tape)` / `parse_drift(frames)` → `list[DriftFinding]` | drift findings vs the installed SDK |
+| `ReplayTransport(frames)` / `.from_tape(tape, keep_subtypes=None)` | the transport under `replay`/`replay_tape`, for wiring a client by hand |
+| `RecordingTransport(inner, tape)` | passive MITM tee, both directions |
+| `CassetteMismatchError` | replay diverged from the recording (always fail-closed) |
+| `TapeEntry` / `Frame` | the tape entry and raw-frame types |
 | `claude-agent-cassette drift <path…>` | CLI drift gate (non-zero on drift / empty) |
 
 ## How it works (the non-obvious bits)

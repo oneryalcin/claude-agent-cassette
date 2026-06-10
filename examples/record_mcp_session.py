@@ -32,7 +32,7 @@ from claude_agent_sdk import (
     tool,
 )
 
-from claude_agent_cassette import record_sdk_wire, scrub_tape, serialize_tape
+from claude_agent_cassette import record, save_tape, scrub_tape
 
 _OUT = Path(__file__).parent / "cassettes" / "mcp_session.jsonl"
 # Pin a non-Covered (zero-data-retention-OK) model: the default rotated to Fable 5,
@@ -117,7 +117,7 @@ async def main() -> None:
         model=_MODEL,
     )
     print("Recording mcp session ...\n")
-    with record_sdk_wire() as tape:
+    with record() as tape:
         async with ClaudeSDKClient(options) as client:
             await client.query(_PROMPT)
             async for message in client.receive_response():
@@ -126,7 +126,7 @@ async def main() -> None:
 
     scrubbed = scrub_tape(tape, _pii_replacements())
     _OUT.parent.mkdir(parents=True, exist_ok=True)
-    _OUT.write_text(serialize_tape(scrubbed))
+    save_tape(scrubbed, _OUT)
     print(f"\nWrote {len(scrubbed)} frames -> {_OUT}")
     _summary(scrubbed)
 

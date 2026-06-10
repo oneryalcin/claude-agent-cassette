@@ -27,16 +27,19 @@ from claude_agent_sdk import (
 
 from claude_agent_cassette import (
     CassetteMismatchError,
-    ControlReplayLedger,
     ReplayTransport,
-    control_stub_options,
     direction_b_exchanges,
-    direction_b_replay_findings,
+    lint_tape,
     load_tape,
-    recorded_hook_config,
     replay_tape,
 )
-from claude_agent_cassette.control_stubs import build_permission_stub, build_hook_stubs
+from claude_agent_cassette.direction_b import (
+    ControlReplayLedger,
+    build_hook_stubs,
+    build_permission_stub,
+    control_stub_bundle,
+)
+from claude_agent_cassette.tape import recorded_hook_config
 
 _PERMISSION = Path(__file__).parent.parent / "examples" / "cassettes" / "permission_session.jsonl"
 _HOOKS = Path(__file__).parent.parent / "examples" / "cassettes" / "hooks_session.jsonl"
@@ -125,12 +128,12 @@ def test_recorded_hook_config_reads_initialize_structure():
     }
 
 
-# --- control_stub_options: bundle shape, non-mutation, fail-closed on unsupported ---
+# --- control_stub_bundle: bundle shape, non-mutation, fail-closed on unsupported ---
 
 
 def test_control_stub_options_installs_stub_and_clears_prompt_tool_name():
     base = ClaudeAgentOptions(can_use_tool=None, permission_prompt_tool_name="x")
-    bundle = control_stub_options(_perm(), base)
+    bundle = control_stub_bundle(_perm(), base)
     assert bundle.keep_subtypes == {"can_use_tool"}
     assert bundle.options.can_use_tool is not None  # stub installed on the copy
     assert bundle.options.permission_prompt_tool_name is None  # cleared (SDK-incompatible)
@@ -146,19 +149,19 @@ def test_control_stub_options_fails_closed_on_unsupported_subtype():
             "subtype": "success", "request_id": "f1", "response": {}}})},
     ]
     with pytest.raises(CassetteMismatchError, match="telepathy"):
-        control_stub_options(future)
+        control_stub_bundle(future)
 
 
-# --- direction_b_replay_findings: lint a tape for replayability ---
+# --- lint_tape: lint a tape for replayability ---
 
 
 def test_replay_findings_empty_for_replayable_fixtures():
-    assert direction_b_replay_findings(_perm()) == []
-    assert direction_b_replay_findings(_hooks()) == []
+    assert lint_tape(_perm()) == []
+    assert lint_tape(_hooks()) == []
 
 
 def test_replay_findings_flag_scrubbed_decisions_not_supported_subtypes():
-    findings = direction_b_replay_findings(load_tape(_WEBSEARCH))
+    findings = lint_tape(load_tape(_WEBSEARCH))
     assert not any("not yet replayable" in f for f in findings)  # all 3 subtypes supported now
     assert any("scrubbed" in f for f in findings)  # decisions/ids scrubbed away
 
@@ -191,8 +194,8 @@ async def _drive_transport(options, transport):
 
 async def test_stub_mode_delivers_permission_requests_inert_drops_them():
     tape = _perm()
-    bundle = control_stub_options(tape)
-    transport = ReplayTransport.from_tape(tape, keep_control_requests=bundle.keep_subtypes)
+    bundle = control_stub_bundle(tape)
+    transport = ReplayTransport.from_tape(tape, keep_subtypes=bundle.keep_subtypes)
     await asyncio.wait_for(_drive_transport(bundle.options, transport), _TIMEOUT_S)
     assert [d["behavior"] for d in _written_decisions(transport.writes, "behavior")] == ["allow", "deny"]
 
@@ -203,9 +206,9 @@ async def test_stub_mode_delivers_permission_requests_inert_drops_them():
 
 async def test_stub_mode_delivers_hook_requests_inert_drops_them():
     tape = _hooks()
-    bundle = control_stub_options(tape)
+    bundle = control_stub_bundle(tape)
     assert bundle.keep_subtypes == {"hook_callback"}
-    transport = ReplayTransport.from_tape(tape, keep_control_requests=bundle.keep_subtypes)
+    transport = ReplayTransport.from_tape(tape, keep_subtypes=bundle.keep_subtypes)
     await asyncio.wait_for(_drive_transport(bundle.options, transport), _TIMEOUT_S)
     answered = _written_decisions(transport.writes, "hookSpecificOutput")
     assert len(answered) == 1 and answered[0]["hookSpecificOutput"]["permissionDecision"] == "allow"

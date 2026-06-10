@@ -18,7 +18,7 @@ from typing import NamedTuple, TextIO
 import claude_agent_sdk
 
 from .drift import parse_drift
-from .tape import RawMessage, message_frames, replayable_messages
+from .tape import Frame, message_frames, conversation_frames
 
 
 _DEFAULT_INPUT_NAME = "input.jsonl"
@@ -89,14 +89,14 @@ def _collect_tapes(paths: list[str], input_name: str | None = None) -> list[Cass
     return tapes
 
 
-def _load_frames(path: Path) -> list[RawMessage]:
+def _load_frames(path: Path) -> list[Frame]:
     """Message frames to drift-check from a cassette file, auto-detecting format:
     a full duplex tape (entries carry ``dir``) or a raw inbound-frame cassette
     (``examples/cassettes/*.jsonl``). Treating every file as a tape silently
     yielded zero frames for raw cassettes — and so 'no drift' for anything."""
     entries = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
     if entries and isinstance(entries[0], dict) and "dir" in entries[0]:
-        return replayable_messages(entries)  # full duplex tape
+        return conversation_frames(entries)  # full duplex tape
     return message_frames(entries)  # raw inbound-frame cassette
 
 

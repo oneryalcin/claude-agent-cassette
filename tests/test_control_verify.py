@@ -25,10 +25,12 @@ from claude_agent_sdk import (
 
 from claude_agent_cassette import (
     CassetteMismatchError,
-    ControlReplayLedger,
-    control_verify_options,
     load_tape,
     replay_tape,
+)
+from claude_agent_cassette.direction_b import (
+    ControlReplayLedger,
+    control_verify_bundle,
     verify_direction_b_decisions,
 )
 
@@ -132,12 +134,12 @@ async def test_verify_raises_when_hook_structure_differs():
 
 def test_verify_requires_can_use_tool_callback():
     with pytest.raises(CassetteMismatchError, match="options.can_use_tool"):
-        control_verify_options(load_tape(_PERMISSION), ClaudeAgentOptions())
+        control_verify_bundle(load_tape(_PERMISSION), ClaudeAgentOptions())
 
 
 def test_verify_requires_hooks():
     with pytest.raises(CassetteMismatchError, match="options.hooks"):
-        control_verify_options(load_tape(_HOOKS), ClaudeAgentOptions())
+        control_verify_bundle(load_tape(_HOOKS), ClaudeAgentOptions())
 
 
 def test_verify_fails_closed_on_unsupported_subtype():
@@ -149,7 +151,7 @@ def test_verify_fails_closed_on_unsupported_subtype():
             "subtype": "success", "request_id": "f1", "response": {}}})},
     ]
     with pytest.raises(CassetteMismatchError, match="telepathy"):
-        control_verify_options(future, ClaudeAgentOptions())
+        control_verify_bundle(future, ClaudeAgentOptions())
 
 
 async def test_verify_tape_without_direction_b_needs_no_callbacks():

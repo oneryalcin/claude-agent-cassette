@@ -9,13 +9,13 @@ typed messages your app would receive.
 import asyncio
 from pathlib import Path
 
-from claude_agent_cassette import load_cassette, replay
+from claude_agent_cassette import load_frames, replay
 
 CASSETTE = Path(__file__).parent / "cassettes" / "hello_world.jsonl"
 
 
 async def main() -> None:
-    async with replay(load_cassette(CASSETTE)) as client:
+    async with replay(load_frames(CASSETTE)) as client:
         async for message in client.receive_messages():
             kind = type(message).__name__
             print(f"{kind}: {getattr(message, 'result', '') or ''}")

@@ -25,7 +25,7 @@ from typing import Any
 
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, HookMatcher
 
-from claude_agent_cassette import record_sdk_wire, scrub_tape, serialize_tape
+from claude_agent_cassette import record, save_tape, scrub_tape
 
 _OUT = Path(__file__).parent / "cassettes" / "hooks_session.jsonl"
 _PROMPT = "Run the bash command: echo hello-from-hooks"
@@ -98,7 +98,7 @@ async def main() -> None:
             model=_MODEL,
         )
         print(f"Recording hooks session in {cwd} ...")
-        with record_sdk_wire() as tape:
+        with record() as tape:
             async with ClaudeSDKClient(options=options) as client:
                 await client.query(_PROMPT)
                 async for message in client.receive_response():
@@ -107,7 +107,7 @@ async def main() -> None:
 
         scrubbed = scrub_tape(tape, _pii_replacements(cwd))
         _OUT.parent.mkdir(parents=True, exist_ok=True)
-        _OUT.write_text(serialize_tape(scrubbed))
+        save_tape(scrubbed, _OUT)
         print(f"\nWrote {len(scrubbed)} frames -> {_OUT}")
         _summary(scrubbed)
 

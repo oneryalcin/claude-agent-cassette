@@ -10,13 +10,14 @@ import json
 from pathlib import Path
 
 from claude_agent_cassette import (
+    conversation_frames,
+    direction_b_exchanges,
+    load_tape,
+)
+from claude_agent_cassette.tape import (
     control_request_subtype,
     control_responses_by_subtype,
-    conversation_messages,
-    direction_b_exchanges,
     direction_b_read_frames,
-    load_tape,
-    replayable_messages,
 )
 
 
@@ -44,8 +45,8 @@ def _tape() -> list[dict]:
     ]
 
 
-def test_replayable_messages_keeps_conversation_drops_all_control():
-    msgs = replayable_messages(_tape())
+def test_conversation_frames_keeps_conversation_drops_all_control():
+    msgs = conversation_frames(_tape())
     assert [m["type"] for m in msgs] == ["assistant", "result"]
 
 
@@ -70,7 +71,7 @@ def test_unmatched_writes_and_responses_are_dropped():
 
 
 def test_empty_tape():
-    assert replayable_messages([]) == []
+    assert conversation_frames([]) == []
     assert control_responses_by_subtype([]) == {}
 
 
@@ -174,11 +175,11 @@ def test_direction_b_read_frames_keeps_control_requests_drops_responses():
     assert "assistant" in types and "result" in types  # conversation kept
 
 
-def test_direction_b_read_frames_vs_replayable_messages_differ_only_on_requests():
+def test_direction_b_read_frames_vs_conversation_frames_differ_only_on_requests():
     # The two views agree on conversation but disagree on control_requests: the
     # Direction-B view keeps them, the inert view drops them.
     b = direction_b_read_frames(_tape())
-    inert = replayable_messages(_tape())
+    inert = conversation_frames(_tape())
     assert [f["type"] for f in b if f["type"] == "control_request"]  # B keeps
     assert not [f["type"] for f in inert if f["type"] == "control_request"]  # inert drops
 
@@ -200,10 +201,10 @@ def test_direction_b_read_frames_empty_tape():
     assert direction_b_read_frames([]) == []
 
 
-def test_conversation_messages_is_conversation_only():
-    # regression: conversation_messages must drop ALL control frames (it once kept
-    # control_requests, contradicting its name) — it's a synonym of replayable_messages.
-    convo = conversation_messages(load_tape(_WEBSEARCH))
+def test_conversation_frames_is_conversation_only():
+    # regression: conversation_frames must drop ALL control frames (it once kept
+    # control_requests, contradicting its name) — it's a synonym of conversation_frames.
+    convo = conversation_frames(load_tape(_WEBSEARCH))
     types = {f.get("type") for f in convo}
     assert "control_request" not in types and "control_response" not in types
-    assert convo == replayable_messages(load_tape(_WEBSEARCH))
+    assert convo == conversation_frames(load_tape(_WEBSEARCH))

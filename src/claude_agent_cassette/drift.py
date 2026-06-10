@@ -13,7 +13,7 @@ Two drift signals (kept distinct so a human can adjudicate):
   newer type an older SDK skips). Forward-compatible skip in the SDK → drift here.
 
 **Contract.** This runs over a cassette's *message-producing* frames
-(:func:`~claude_agent_cassette.replayable_messages` — control_request/_response
+(:func:`~claude_agent_cassette.conversation_frames` — control_request/_response
 are excluded because the control plane is not message-parsed and would return
 ``None`` spuriously). Cassette inputs are curated to be message producers, so a
 ``None`` among them is real drift, not noise.
@@ -36,7 +36,7 @@ from typing import Literal, NamedTuple
 
 from claude_agent_sdk._internal.message_parser import parse_message
 
-from .tape import RawMessage, TapeEntry, replayable_messages
+from .tape import Frame, TapeEntry, conversation_frames
 
 # The closed set of drift reasons this detector emits. A Literal (not an Enum):
 # it's a code-controlled vocabulary consumers branch on, so it earns a type — but
@@ -53,7 +53,7 @@ class DriftFinding(NamedTuple):
     detail: str  # human-readable specifics for the reason
 
 
-def _dropped_content_blocks(frame: RawMessage, message: object) -> str | None:
+def _dropped_content_blocks(frame: Frame, message: object) -> str | None:
     """Detail string if the parse silently dropped content blocks, else None.
 
     ``parse_message`` matches each content block's ``type`` and appends only the
@@ -76,7 +76,7 @@ def _dropped_content_blocks(frame: RawMessage, message: object) -> str | None:
     )
 
 
-def parse_drift(frames: list[RawMessage]) -> list[DriftFinding]:
+def parse_drift(frames: list[Frame]) -> list[DriftFinding]:
     """Findings for every frame that doesn't survive the installed SDK intact.
 
     A frame drifts if ``parse_message`` raises (``parse_error``), returns ``None``
@@ -107,6 +107,6 @@ def parse_drift(frames: list[RawMessage]) -> list[DriftFinding]:
     return findings
 
 
-def check_tape(tape: list[TapeEntry]) -> list[DriftFinding]:
+def check_drift(tape: list[TapeEntry]) -> list[DriftFinding]:
     """Drift findings for a full duplex tape (checks its message-producing frames)."""
-    return parse_drift(replayable_messages(tape))
+    return parse_drift(conversation_frames(tape))

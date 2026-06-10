@@ -7,13 +7,13 @@ from typing import AsyncIterator, Literal, Optional
 
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
 
-from .control_stubs import (
-    control_stub_options,
-    control_verify_options,
+from .direction_b import (
+    control_stub_bundle,
+    control_verify_bundle,
     verify_direction_b_decisions,
     verify_initialize_hook_ids,
 )
-from .tape import RawMessage, TapeEntry
+from .tape import Frame, TapeEntry
 from .transport import ReplayTransport
 
 ReplayMode = Literal["inert", "stub", "verify"]
@@ -21,10 +21,10 @@ ReplayMode = Literal["inert", "stub", "verify"]
 
 @asynccontextmanager
 async def replay(
-    messages: list[RawMessage],
+    frames: list[Frame],
     options: Optional[ClaudeAgentOptions] = None,
 ) -> AsyncIterator[ClaudeSDKClient]:
-    """Drive a real ``ClaudeSDKClient`` over a ``ReplayTransport`` fed ``messages``.
+    """Drive a real ``ClaudeSDKClient`` over a ``ReplayTransport`` fed ``frames``.
 
     No API key, no subprocess — the recorded frames flow through the SDK's real
     parser. Iterate ``receive_messages()`` and assert on the typed messages your
@@ -36,16 +36,16 @@ async def replay(
 
     Usage::
 
-        from claude_agent_cassette import replay, load_cassette
+        from claude_agent_cassette import replay, load_frames
 
-        async with replay(load_cassette("session.jsonl")) as client:
+        async with replay(load_frames("session.jsonl")) as client:
             async for message in client.receive_messages():
                 if type(message).__name__ == "ResultMessage":
                     break
     """
     client = ClaudeSDKClient(
         options=options or ClaudeAgentOptions(),
-        transport=ReplayTransport(messages),
+        transport=ReplayTransport(frames),
     )
     await client.connect()
     try:
@@ -102,9 +102,9 @@ async def replay_tape(
                     break
     """
     if mode in ("stub", "verify"):
-        build = control_stub_options if mode == "stub" else control_verify_options
+        build = control_stub_bundle if mode == "stub" else control_verify_bundle
         bundle = build(tape, options)
-        transport = ReplayTransport.from_tape(tape, keep_control_requests=bundle.keep_subtypes)
+        transport = ReplayTransport.from_tape(tape, keep_subtypes=bundle.keep_subtypes)
         client = ClaudeSDKClient(options=bundle.options, transport=transport)
         await client.connect()
         if "hook_callback" in bundle.keep_subtypes:

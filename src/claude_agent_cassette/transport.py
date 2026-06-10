@@ -21,12 +21,12 @@ from typing import Any, Optional
 from claude_agent_sdk import Transport
 
 from .tape import (
-    RawMessage,
+    Frame,
     TapeEntry,
     control_request_subtype,
     control_responses_by_subtype,
     direction_b_read_frames,
-    replayable_messages,
+    conversation_frames,
 )
 
 # End-of-stream sentinel on the internal queue — a module-level singleton so
@@ -49,7 +49,7 @@ class ReplayTransport(Transport):
     """Replays a recorded raw-dict stream into the SDK, in-process (no subprocess).
 
     Args:
-        messages: recorded inbound frames (raw stream-json dicts) in order — the
+        frames: recorded inbound frames (raw stream-json dicts) in order — the
             conversation to replay. Do NOT include the initialize
             ``control_response``; it is synthesised here from the live id.
 
@@ -62,7 +62,7 @@ class ReplayTransport(Transport):
 
     Two construction paths:
 
-    - ``ReplayTransport(messages)`` — conversation-only replay. Every
+    - ``ReplayTransport(frames)`` — conversation-only replay. Every
       ``control_request`` is answered with a synthesised generic success; no
       control-plane fidelity.
     - ``ReplayTransport.from_tape(tape)`` — replay a full duplex recording.
@@ -102,10 +102,10 @@ class ReplayTransport(Transport):
 
     def __init__(
         self,
-        messages: list[RawMessage],
-        recorded_responses_by_subtype: Optional[dict[str, deque[RawMessage]]] = None,
+        frames: list[Frame],
+        recorded_responses_by_subtype: Optional[dict[str, deque[Frame]]] = None,
     ) -> None:
-        self._messages = messages
+        self._frames = frames
         # Recorded Direction-A control_responses, keyed by the subtype of the
         # request they answered (per-subtype FIFO). None -> legacy generic-success
         # behaviour; a dict -> tape mode (subtype-matched, fail-closed).
@@ -119,7 +119,7 @@ class ReplayTransport(Transport):
 
     @classmethod
     def from_tape(
-        cls, tape: list[TapeEntry], keep_control_requests: set[str] | None = None
+        cls, tape: list[TapeEntry], keep_subtypes: set[str] | None = None
     ) -> ReplayTransport:
         """Build a control-aware replay from a full duplex tape.
 
@@ -127,9 +127,9 @@ class ReplayTransport(Transport):
         to stream and the recorded Direction-A answers keyed by request subtype
         (:func:`control_responses_by_subtype`).
 
-        ``keep_control_requests`` selects the inbound-stream view:
+        ``keep_subtypes`` selects the inbound-stream view:
 
-        - ``None`` (default) — conversation only (:func:`replayable_messages`):
+        - ``None`` (default) — conversation only (:func:`conversation_frames`):
           Direction-B ``control_request``s are dropped so a consumer's registered
           callbacks stay **inert** on replay.
         - a set of subtypes — **Direction-B mode**: those ``control_request``s are
@@ -138,11 +138,11 @@ class ReplayTransport(Transport):
           :func:`~claude_agent_cassette.replay_tape`, which wires both), or those
           live callbacks will run.
         """
-        if keep_control_requests is None:
-            messages = replayable_messages(tape)
+        if keep_subtypes is None:
+            frames = conversation_frames(tape)
         else:
-            messages = direction_b_read_frames(tape, keep_subtypes=keep_control_requests)
-        return cls(messages, control_responses_by_subtype(tape))
+            frames = direction_b_read_frames(tape, keep_subtypes=keep_subtypes)
+        return cls(frames, control_responses_by_subtype(tape))
 
     async def connect(self) -> None:
         self._ready = True
@@ -159,7 +159,7 @@ class ReplayTransport(Transport):
         if isinstance(message, dict) and message.get("type") == "control_request":
             await self._answer_control_request(message)
 
-    async def _answer_control_request(self, request: RawMessage) -> None:
+    async def _answer_control_request(self, request: Frame) -> None:
         # Answer for the live request id (the SDK demuxes the response by
         # request_id), then stream the recorded conversation once.
         live_id = request.get("request_id")
@@ -167,10 +167,10 @@ class ReplayTransport(Transport):
         await self._queue.put(self._response_for(subtype, live_id))
         if not self._streamed:
             self._streamed = True
-            for raw in self._messages:
+            for raw in self._frames:
                 await self._queue.put(raw)
 
-    def _response_for(self, subtype: Optional[str], live_id: Optional[str]) -> RawMessage:
+    def _response_for(self, subtype: Optional[str], live_id: Optional[str]) -> Frame:
         """The control_response to return for a live Direction-A request.
 
         Legacy mode (no tape) synthesises a generic success. Tape mode hands back
@@ -248,7 +248,7 @@ class RecordingTransport(Transport):
         await self._inner.close()
 
 
-def _control_response(request_id: Optional[str]) -> RawMessage:
+def _control_response(request_id: Optional[str]) -> Frame:
     """The success control_response the SDK's read loop matches by request id.
 
     Shape verified against claude-agent-sdk 0.2.x: ``Query._read_messages`` routes
