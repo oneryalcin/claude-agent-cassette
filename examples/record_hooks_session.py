@@ -25,7 +25,7 @@ from typing import Any
 
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, HookMatcher
 
-from claude_agent_cassette import record_sdk_wire, serialize_tape
+from claude_agent_cassette import record_sdk_wire, scrub_tape, serialize_tape
 
 _OUT = Path(__file__).parent / "cassettes" / "hooks_session.jsonl"
 _PROMPT = "Run the bash command: echo hello-from-hooks"
@@ -46,20 +46,8 @@ async def pretooluse_hook(input_data: Any, tool_use_id: Any, context: Any) -> di
     }
 
 
-def _redact(obj: Any, replacements: list[tuple[str, str]]) -> Any:
-    if isinstance(obj, str):
-        for needle, mask in replacements:
-            if needle:
-                obj = obj.replace(needle, mask)
-        return obj
-    if isinstance(obj, list):
-        return [_redact(v, replacements) for v in obj]
-    if isinstance(obj, dict):
-        return {k: _redact(v, replacements) for k, v in obj.items()}
-    return obj
-
-
-def _scrub_tape(tape: list[dict], cwd: str) -> list[dict]:
+def _pii_replacements(cwd: str) -> list[tuple[str, str]]:
+    """The (needle, mask) pairs that blank this recording's filesystem fingerprint."""
     replacements = [
         (os.path.realpath(cwd), "<CWD>"),
         (cwd, "<CWD>"),
@@ -68,20 +56,7 @@ def _scrub_tape(tape: list[dict], cwd: str) -> list[dict]:
     key = os.environ.get("ANTHROPIC_API_KEY")
     if key:
         replacements.append((key, "<REDACTED_API_KEY>"))
-    replacements.sort(key=lambda r: len(r[0]), reverse=True)
-
-    scrubbed: list[dict] = []
-    for entry in tape:
-        if entry.get("dir") == "write" and isinstance(entry.get("data"), str):
-            try:
-                payload = json.loads(entry["data"])
-            except ValueError:
-                scrubbed.append(_redact(entry, replacements))
-                continue
-            scrubbed.append({"dir": "write", "data": json.dumps(_redact(payload, replacements))})
-        else:
-            scrubbed.append(_redact(entry, replacements))
-    return scrubbed
+    return replacements
 
 
 def _summary(scrubbed: list[dict]) -> None:
@@ -130,7 +105,7 @@ async def main() -> None:
                     if type(message).__name__ == "ResultMessage":
                         break
 
-        scrubbed = _scrub_tape(tape, cwd)
+        scrubbed = scrub_tape(tape, _pii_replacements(cwd))
         _OUT.parent.mkdir(parents=True, exist_ok=True)
         _OUT.write_text(serialize_tape(scrubbed))
         print(f"\nWrote {len(scrubbed)} frames -> {_OUT}")

@@ -44,7 +44,7 @@ from claude_agent_sdk import (
     ToolPermissionContext,
 )
 
-from claude_agent_cassette import record_sdk_wire, serialize_tape
+from claude_agent_cassette import record_sdk_wire, scrub_tape, serialize_tape
 
 _OUT = Path(__file__).parent / "cassettes" / "permission_session.jsonl"
 # Pin a non-Covered (zero-data-retention-OK) model: the default rotated to Fable 5,
@@ -103,59 +103,17 @@ async def deterministic_permission(
     return PermissionResultDeny(message=f"Tool not permitted in recording: {tool_name}")
 
 
-def _redact(obj: Any, replacements: list[tuple[str, str]]) -> Any:
-    """Recursively blank PII *values* while preserving every key and structure.
-
-    Only string values are touched, and only by substituting known-sensitive
-    substrings (absolute paths, API key) with placeholders. Control-plane decision
-    fields (``behavior`` / ``updatedInput`` / ``message`` / ``request_id`` / subtypes)
-    are never special-cased away — they ride through untouched, except that an
-    absolute path *inside* ``updatedInput`` gets its home/temp prefix masked, which
-    keeps the decision shape intact while removing the leak.
-    """
-    if isinstance(obj, str):
-        for needle, mask in replacements:
-            if needle:
-                obj = obj.replace(needle, mask)
-        return obj
-    if isinstance(obj, list):
-        return [_redact(v, replacements) for v in obj]
-    if isinstance(obj, dict):
-        return {k: _redact(v, replacements) for k, v in obj.items()}
-    return obj
-
-
-def _scrub_tape(tape: list[dict], cwd: str) -> list[dict]:
-    """Decision-preserving scrub: mask filesystem PII, keep control decisions.
-
-    ``write`` entries carry a JSON *string* (``data``); we parse, redact, re-serialize
-    so the masked path doesn't survive as raw text. ``read`` entries carry a dict
-    (``frame``) redacted in place. Nothing is dropped or reshaped — only values blanked.
-    """
+def _pii_replacements(cwd: str) -> list[tuple[str, str]]:
+    """The (needle, mask) pairs that blank this recording's filesystem fingerprint."""
     replacements = [
-        (cwd, "<CWD>"),
         (os.path.realpath(cwd), "<CWD>"),
+        (cwd, "<CWD>"),
         (os.path.expanduser("~"), "<HOME>"),
     ]
     key = os.environ.get("ANTHROPIC_API_KEY")
     if key:
         replacements.append((key, "<REDACTED_API_KEY>"))
-    # Longest needle first, so a specific path (…/private/var/…/tmpX) is masked
-    # before a shorter prefix of it (/var/…/tmpX) can match inside it.
-    replacements.sort(key=lambda r: len(r[0]), reverse=True)
-
-    scrubbed: list[dict] = []
-    for entry in tape:
-        if entry.get("dir") == "write" and isinstance(entry.get("data"), str):
-            try:
-                payload = json.loads(entry["data"])
-            except ValueError:
-                scrubbed.append(_redact(entry, replacements))
-                continue
-            scrubbed.append({"dir": "write", "data": json.dumps(_redact(payload, replacements))})
-        else:
-            scrubbed.append(_redact(entry, replacements))
-    return scrubbed
+    return replacements
 
 
 def _summary(scrubbed: list[dict]) -> None:
@@ -200,7 +158,7 @@ async def main() -> None:
                     if type(message).__name__ == "ResultMessage":
                         break
 
-        scrubbed = _scrub_tape(tape, cwd)
+        scrubbed = scrub_tape(tape, _pii_replacements(cwd))
         _OUT.parent.mkdir(parents=True, exist_ok=True)
         _OUT.write_text(serialize_tape(scrubbed))
         print(f"\nWrote {len(scrubbed)} frames -> {_OUT}")

@@ -26,7 +26,13 @@ from .tape import (
     replayable_messages,
     serialize_tape,
 )
-from .control_stubs import ControlReplayLedger, ControlStubBundle, control_stub_options
+from .control_stubs import (
+    ControlReplayLedger,
+    ControlStubBundle,
+    control_stub_options,
+    direction_b_replay_findings,
+)
+from .redact import scrub_tape
 from .drift import DriftFinding, check_tape, parse_drift
 from .transport import CassetteMismatchError, RecordingTransport, ReplayTransport
 
@@ -57,6 +63,8 @@ __all__ = [
     "control_stub_options",
     "ControlStubBundle",
     "ControlReplayLedger",
+    "direction_b_replay_findings",
+    "scrub_tape",
     "replay_tape",
     "parse_drift",
     "check_tape",

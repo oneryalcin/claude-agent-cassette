@@ -45,7 +45,9 @@ from claude_agent_sdk import (
 from .tape import (
     ControlExchange,
     TapeEntry,
+    control_request_subtype,
     direction_b_exchanges,
+    read_frames,
     recorded_hook_config,
 )
 from .transport import CassetteMismatchError
@@ -291,6 +293,52 @@ def verify_initialize_hook_ids(
             f"SDK assigned {live_ids} — the recorded hook_callback requests won't resolve to "
             "the stubs (scrubbed recording, or the SDK changed its id scheme)"
         )
+
+
+def direction_b_replay_findings(tape: list[TapeEntry]) -> list[str]:
+    """Reasons a tape isn't fully Direction-B replayable (``mode="stub"``), or ``[]`` if it is.
+
+    A lint, not a gate: run it after :func:`~claude_agent_cassette.scrub_tape` to confirm a
+    scrub didn't break replay (the classic mistake — scrubbing ``hookCallbackIds`` or the
+    decision payload), or over committed fixtures in CI. Checks that every Direction-B
+    request has a recorded response, no decision is scrubbed or an error envelope, hook ids
+    reproduce (``hook_0``, ``hook_1``, … contiguous), and no subtype lacks a stub builder.
+    """
+    findings: list[str] = []
+    exchanges = direction_b_exchanges(tape)
+
+    for subtype in sorted(set(exchanges) - SUPPORTED_SUBTYPES):
+        findings.append(f"{subtype}: not yet replayable (no stub builder)")
+
+    paired_ids = {ex.request_id for group in exchanges.values() for ex in group}
+    for frame in read_frames(tape):
+        if frame.get("type") == "control_request" and frame.get("request_id") not in paired_ids:
+            findings.append(
+                f"{control_request_subtype(frame)} request {frame.get('request_id')!r}: "
+                "no recorded response (unpaired) — can't replay a decision for it"
+            )
+
+    for subtype, group in exchanges.items():
+        for exchange in group:
+            if not exchange.succeeded:
+                findings.append(
+                    f"{subtype} {exchange.request_id!r}: recorded an error envelope, not a decision"
+                )
+            elif "<scrubbed>" in json.dumps(exchange.decision):
+                findings.append(
+                    f"{subtype} {exchange.request_id!r}: decision is scrubbed — not replayable"
+                )
+
+    config = recorded_hook_config(tape)
+    if config:
+        ids = _flatten_hook_ids(config)
+        expected = [f"hook_{i}" for i in range(len(ids))]
+        if ids != expected:
+            findings.append(
+                f"hook callback ids {ids} can't be reproduced (expected {expected}; "
+                "scrubbed or non-contiguous from hook_0)"
+            )
+    return findings
 
 
 def control_stub_options(

@@ -31,6 +31,7 @@ from claude_agent_cassette import (
     ReplayTransport,
     control_stub_options,
     direction_b_exchanges,
+    direction_b_replay_findings,
     load_tape,
     recorded_hook_config,
     replay_tape,
@@ -139,7 +140,21 @@ def test_control_stub_options_installs_stub_and_clears_prompt_tool_name():
 def test_control_stub_options_fails_closed_on_unsupported_subtype():
     # websearch carries mcp_message, which has no stub builder yet -> raise, not silent.
     with pytest.raises(CassetteMismatchError, match="mcp_message"):
-        control_stub_options(_WEBSEARCH and load_tape(_WEBSEARCH))
+        control_stub_options(load_tape(_WEBSEARCH))
+
+
+# --- direction_b_replay_findings: lint a tape for replayability ---
+
+
+def test_replay_findings_empty_for_replayable_fixtures():
+    assert direction_b_replay_findings(_perm()) == []
+    assert direction_b_replay_findings(_hooks()) == []
+
+
+def test_replay_findings_flag_unsupported_and_scrubbed():
+    findings = direction_b_replay_findings(load_tape(_WEBSEARCH))
+    assert any("mcp_message" in f for f in findings)  # unsupported subtype
+    assert any("scrubbed" in f for f in findings)  # decisions/ids scrubbed away
 
 
 # --- Behavioral: stub mode delivers the requests (SDK writes decisions); inert drops them ---
