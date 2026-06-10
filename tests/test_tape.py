@@ -181,9 +181,12 @@ def test_direction_b_read_frames_vs_replayable_messages_differ_only_on_requests(
     inert = replayable_messages(_tape())
     assert [f["type"] for f in b if f["type"] == "control_request"]  # B keeps
     assert not [f["type"] for f in inert if f["type"] == "control_request"]  # inert drops
+
     # same conversation frames in both
-    conv = lambda fs: [f["type"] for f in fs if f["type"] not in ("control_request", "control_response")]
-    assert conv(b) == conv(inert)
+    def conv_types(frames):
+        return [f["type"] for f in frames if f["type"] not in ("control_request", "control_response")]
+
+    assert conv_types(b) == conv_types(inert)
 
 
 def test_direction_b_read_frames_on_real_websearch_keeps_23_requests():
