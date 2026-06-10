@@ -121,13 +121,28 @@ drift: 5 cassette(s) vs claude-agent-sdk 0.2.87
   `expected.jsonl` / `meta.json` are ignored, and a drift row is named by the
   cassette dir. Use `--input-name FILE` for a different recording filename. A dir
   mixing both layouts is rejected (it can't silently check only half).
-- Three drift signals: `parse_error` (the parser rejected the frame), `unrecognized_type`
-  (the message type is gone), `content_dropped` (a content block silently vanished).
-- **Scope**: catches *parse-level* drift (rejected/skipped frames) + dropped content
-  blocks. It does **not** catch additive *field-level* drift (a still-parsing frame
-  that gained a field) — see [ROADMAP.md](ROADMAP.md).
+- Four drift signals: `parse_error` (the parser rejected the frame), `unrecognized_type`
+  (the message type is gone), `content_dropped` (a content block silently vanished),
+  and `unmodeled_field` (field-level drift, opt-in — below).
+- **Field-level drift** (`--fields`): catches the *additive* changes the parser
+  tolerates — a recorded field the installed SDK silently ignores. Detection runs the
+  SDK's real parser over an access-tracking view of each frame: anything the parser
+  neither **read** nor **retained** in the typed message is unmodeled. Since most
+  unmodeled fields are steady-state wire noise (`message.role`, `timestamp`), the gate
+  diffs against a committed baseline sidecar (`<name>.fields.json`, or `fields.json`
+  inside a nested cassette dir):
 
-In Python: `parse_drift(frames)` / `check_drift(tape)` → `list[DriftFinding]`.
+  ```bash
+  claude-agent-cassette drift tests/cassettes/ --update-field-baselines  # author + commit
+  claude-agent-cassette drift tests/cassettes/ --fields                  # the CI gate
+  ```
+
+  Fail-closed: a cassette without a baseline (or with a corrupt one) exits non-zero.
+  Baselines are per-SDK-pin artifacts — refresh them when you bump the SDK and the
+  gate notes stale entries.
+
+In Python: `parse_drift(frames)` / `check_drift(tape)` → `list[DriftFinding]`;
+`unmodeled_fields(frames)` → baseline keys; `field_drift(frames, baseline)` → findings.
 
 ## Control-protocol replay (the duplex wire)
 
@@ -245,6 +260,7 @@ offline):
 | `scrub_tape(tape, replacements)` | decision-preserving PII scrub for sharing a recording |
 | `lint_tape(tape)` | lint a tape for Direction-B replayability (run after scrubbing) |
 | `check_drift(tape)` / `parse_drift(frames)` → `list[DriftFinding]` | drift findings vs the installed SDK |
+| `unmodeled_fields(frames)` / `field_drift(frames, baseline)` | field-level drift: recorded fields the installed SDK silently ignores |
 | `ReplayTransport(frames)` / `.from_tape(tape, keep_subtypes=None)` | the transport under `replay`/`replay_tape`, for wiring a client by hand |
 | `RecordingTransport(inner, tape)` | passive MITM tee, both directions |
 | `CassetteMismatchError` | replay diverged from the recording (always fail-closed) |
@@ -277,8 +293,9 @@ See [ROADMAP.md](ROADMAP.md). Shipped: conversation replay, recording,
 **Direction-A control replay** (`ReplayTransport.from_tape`), **drift detection**,
 **Direction-B replay for all three subtypes** (`can_use_tool` / `hook_callback` /
 `mcp_message`, in both `mode="stub"` and `mode="verify"`), and a
-**decision-preserving scrub** (`scrub_tape`), and a **pytest plugin** (marker/fixture,
-record-on-miss, timeout-not-hang). Next up: `interrupt` lockstep and field-level drift.
+**decision-preserving scrub** (`scrub_tape`), a **pytest plugin** (marker/fixture,
+record-on-miss, timeout-not-hang), and **field-level drift** (`drift --fields`).
+Next up: `interrupt` lockstep, curation tooling, assertion helpers.
 
 ## License
 

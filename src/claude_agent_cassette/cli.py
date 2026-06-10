@@ -17,7 +17,7 @@ from typing import NamedTuple, TextIO
 
 import claude_agent_sdk
 
-from .drift import parse_drift
+from .drift import field_drift, parse_drift, unmodeled_fields
 from .tape import Frame, message_frames, conversation_frames
 
 
@@ -34,6 +34,7 @@ class Cassette(NamedTuple):
 
     path: Path
     label: str  # how it reads in a drift row: file path (flat) or dir name (nested)
+    fields_path: Path  # the field-baseline sidecar (committed next to the cassette)
 
 
 class MixedLayoutError(Exception):
@@ -72,20 +73,26 @@ def _collect_tapes(paths: list[str], input_name: str | None = None) -> list[Cass
     """
     explicit = input_name is not None
     nested_name = input_name or _DEFAULT_INPUT_NAME
+
+    def flat_cassette(p: Path, label: str) -> Cassette:
+        # Sidecar is .json, not .jsonl, so the flat glob can never collect it.
+        return Cassette(p, label, p.with_name(f"{p.stem}.fields.json"))
+
     tapes: list[Cassette] = []
     for raw in paths:
         path = Path(raw)
         if not path.is_dir():
-            tapes.append(Cassette(path, str(path)))
+            tapes.append(flat_cassette(path, str(path)))
             continue
         nested = sorted(path.glob(f"*/{nested_name}"))
         flat = [] if explicit else sorted(path.glob("*.jsonl"))
         if flat and nested:
             raise MixedLayoutError(path, nested_name)
         if nested:
-            tapes.extend(Cassette(p, p.parent.name) for p in nested)
+            # The cassette dir already holds sidecars — fields.json joins them.
+            tapes.extend(Cassette(p, p.parent.name, p.parent / "fields.json") for p in nested)
         else:
-            tapes.extend(Cassette(p, str(p)) for p in flat)
+            tapes.extend(flat_cassette(p, str(p)) for p in flat)
     return tapes
 
 
@@ -100,9 +107,30 @@ def _load_frames(path: Path) -> list[Frame]:
     return message_frames(entries)  # raw inbound-frame cassette
 
 
+def _read_baseline(path: Path) -> list[str] | None:
+    """The committed field baseline, or None if absent. Corrupt ⇒ ValueError (fail closed)."""
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text())
+        unmodeled = data["unmodeled"]
+        if not isinstance(unmodeled, list) or not all(isinstance(s, str) for s in unmodeled):
+            raise TypeError("'unmodeled' must be a list of strings")
+        return unmodeled
+    except Exception as exc:
+        raise ValueError(f"unreadable field baseline {path}: {exc}") from exc
+
+
+def _write_baseline(path: Path, unmodeled: list[str], sdk_version: str) -> None:
+    path.write_text(
+        json.dumps({"sdk_version": sdk_version, "unmodeled": unmodeled}, indent=2) + "\n"
+    )
+
+
 def _drift(
     paths: list[str], out: TextIO,
     allow_empty: bool = False, input_name: str | None = None,
+    fields: bool = False, update_baselines: bool = False,
 ) -> int:
     sdk_version = getattr(claude_agent_sdk, "__version__", "?")
     try:
@@ -126,16 +154,55 @@ def _drift(
 
     drifted_frames = 0
     drifted_tapes = 0
+    missing_baselines = 0
     for cassette in tapes:
-        findings = parse_drift(_load_frames(cassette.path))
-        if not findings:
+        frames = _load_frames(cassette.path)
+        findings = parse_drift(frames)
+        notes: list[str] = []
+
+        if update_baselines:
+            current = unmodeled_fields(frames)
+            try:
+                previous = _read_baseline(cassette.fields_path)
+            except ValueError:
+                previous = None  # corrupt — overwrite is the requested repair
+            if previous != current:
+                _write_baseline(cassette.fields_path, current, sdk_version)
+                verb = "written" if previous is None else "updated"
+                notes.append(f"field baseline {verb} ({len(current)} field(s))")
+        elif fields:
+            try:
+                baseline = _read_baseline(cassette.fields_path)
+            except ValueError as exc:
+                print(f"drift: {exc}", file=sys.stderr)
+                return EXIT_MISUSE
+            if baseline is None:
+                # Fail closed: an unbaselined cassette is a coverage gap, not a pass.
+                missing_baselines += 1
+                notes.append(
+                    f"no field baseline ({cassette.fields_path}) — create it with "
+                    "--update-field-baselines"
+                )
+            else:
+                findings = findings + field_drift(frames, baseline)
+                stale = sorted(set(baseline) - set(unmodeled_fields(frames)))
+                if stale:
+                    notes.append(
+                        f"{len(stale)} stale baseline entr{'y' if len(stale) == 1 else 'ies'} "
+                        "(the installed SDK now models them) — refresh with "
+                        "--update-field-baselines"
+                    )
+
+        if findings:
+            drifted_tapes += 1
+            drifted_frames += len(findings)
+            print(f"  DRIFT {cassette.label} — {len(findings)} frame(s):", file=out)
+            for f in findings:
+                print(f"          frame[{f.frame_index}] {f.frame_type}: {f.reason} — {f.detail}", file=out)
+        else:
             print(f"  ok    {cassette.label}", file=out)
-            continue
-        drifted_tapes += 1
-        drifted_frames += len(findings)
-        print(f"  DRIFT {cassette.label} — {len(findings)} frame(s):", file=out)
-        for f in findings:
-            print(f"          frame[{f.frame_index}] {f.frame_type}: {f.reason} — {f.detail}", file=out)
+        for note in notes:
+            print(f"          note: {note}", file=out)
 
     if drifted_frames:
         print(
@@ -144,6 +211,13 @@ def _drift(
             file=out,
         )
         return EXIT_DRIFT
+    if missing_baselines:
+        print(
+            f"\n{len(tapes)} checked, no drift — but {missing_baselines} cassette(s) "
+            "have no field baseline (nothing field-checked for them).",
+            file=out,
+        )
+        return EXIT_MISUSE
     print(f"\n{len(tapes)} checked, no drift.", file=out)
     return EXIT_OK
 
@@ -163,11 +237,23 @@ def main(argv: list[str] | None = None) -> int:
              "cassette dir (default auto-detect '*/input.jsonl' when a dir has no "
              "top-level *.jsonl); passing it selects nested-only mode",
     )
+    drift.add_argument(
+        "--fields", action="store_true",
+        help="also gate field-level drift against each cassette's committed "
+             "fields baseline (*.fields.json / fields.json sidecar); a cassette "
+             "without a baseline fails closed",
+    )
+    drift.add_argument(
+        "--update-field-baselines", action="store_true",
+        help="(re)write each cassette's fields baseline from the installed SDK "
+             "instead of gating against it",
+    )
     args = parser.parse_args(argv)
     if args.command == "drift":
         return _drift(
             args.paths, sys.stdout,
             allow_empty=args.allow_empty, input_name=args.input_name,
+            fields=args.fields, update_baselines=args.update_field_baselines,
         )
     parser.error(f"unknown command {args.command!r}")  # pragma: no cover
 

@@ -159,3 +159,89 @@ def test_input_name_is_nested_only_no_flat_fallback(capsys, tmp_path):
     rc = main(["drift", str(tmp_path), "--input-name", "input.jsonl"])
     assert rc == 2
     assert "nothing checked" in capsys.readouterr().err
+
+
+# --- Field-level drift gate (--fields / --update-field-baselines) ---
+
+_MCP_FIXTURE = Path(__file__).parent.parent / "examples" / "cassettes" / "mcp_session.jsonl"
+
+
+def _copy_mcp(dest: Path) -> Path:
+    out = dest / "session.jsonl"
+    out.write_text(_MCP_FIXTURE.read_text())
+    return out
+
+
+def _inject_unmodeled(path: Path) -> None:
+    lines = []
+    for line in path.read_text().splitlines():
+        entry = json.loads(line)
+        frame = entry.get("frame") if entry.get("dir") == "read" else None
+        if frame and frame.get("type") == "assistant":
+            frame["message"]["shiny_new_field"] = 1
+        lines.append(json.dumps(entry))
+    path.write_text("\n".join(lines) + "\n")
+
+
+def test_fields_without_baseline_fails_closed(capsys, tmp_path):
+    _copy_mcp(tmp_path)
+    rc = main(["drift", str(tmp_path), "--fields"])
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "no field baseline" in out and "--update-field-baselines" in out
+
+
+def test_update_then_fields_gate_is_clean(capsys, tmp_path):
+    _copy_mcp(tmp_path)
+    assert main(["drift", str(tmp_path), "--update-field-baselines"]) == 0
+    assert "field baseline written" in capsys.readouterr().out
+    assert (tmp_path / "session.fields.json").exists()
+    assert main(["drift", str(tmp_path), "--fields"]) == 0
+
+
+def test_fields_gate_flags_new_unmodeled_field(capsys, tmp_path):
+    tape = _copy_mcp(tmp_path)
+    main(["drift", str(tmp_path), "--update-field-baselines"])
+    _inject_unmodeled(tape)
+    rc = main(["drift", str(tmp_path), "--fields"])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "unmodeled_field" in out and "shiny_new_field" in out
+
+
+def test_fields_gate_notes_stale_baseline_without_failing(capsys, tmp_path):
+    _copy_mcp(tmp_path)
+    main(["drift", str(tmp_path), "--update-field-baselines"])
+    baseline_path = tmp_path / "session.fields.json"
+    data = json.loads(baseline_path.read_text())
+    data["unmodeled"].append("assistant message.gone_in_new_sdk")
+    baseline_path.write_text(json.dumps(data))
+    rc = main(["drift", str(tmp_path), "--fields"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "stale baseline entry" in out
+
+
+def test_corrupt_baseline_fails_closed(capsys, tmp_path):
+    _copy_mcp(tmp_path)
+    (tmp_path / "session.fields.json").write_text("{not json")
+    rc = main(["drift", str(tmp_path), "--fields"])
+    assert rc == 2
+    assert "unreadable field baseline" in capsys.readouterr().err
+
+
+def test_fields_sidecar_never_collected_as_cassette(capsys, tmp_path):
+    _copy_mcp(tmp_path)
+    main(["drift", str(tmp_path), "--update-field-baselines"])
+    capsys.readouterr()
+    main(["drift", str(tmp_path)])
+    assert "1 cassette(s)" in capsys.readouterr().out  # sidecar not globbed
+
+
+def test_nested_layout_baseline_lives_in_cassette_dir(capsys, tmp_path):
+    nested = tmp_path / "happy_case"
+    nested.mkdir()
+    (nested / "input.jsonl").write_text(_MCP_FIXTURE.read_text())
+    assert main(["drift", str(tmp_path), "--update-field-baselines"]) == 0
+    assert (nested / "fields.json").exists()
+    assert main(["drift", str(tmp_path), "--fields"]) == 0
