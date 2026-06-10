@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import tempfile
 from pathlib import Path
 
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
@@ -91,9 +92,14 @@ def _summary(scrubbed: list[dict]) -> None:
 
 
 async def main() -> None:
+    # Isolate the CLI from the operator's ~/.claude: a fresh config dir means the
+    # recorded system/init inventory (slash commands, plugins, skills, MCP servers,
+    # hooks) is the CLI's builtin baseline, not this machine's fingerprint.
+    config_dir = tempfile.mkdtemp(prefix="cassette-clean-config-")
     options = ClaudeAgentOptions(
         model=_MODEL,
         include_partial_messages=True,
+        env={"CLAUDE_CONFIG_DIR": config_dir},
     )
     print("Recording stop session ...\n")
     with record() as tape:

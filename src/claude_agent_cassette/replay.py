@@ -106,7 +106,9 @@ async def replay_tape(
     how long lockstep waits at a recorded control write for the live one (then
     :class:`~claude_agent_cassette.CassetteMismatchError`, e.g. an interrupt tape
     replayed by a consumer that never interrupts). Lockstep is strict: the live
-    session must issue control calls in recorded order.
+    session must issue control calls in recorded order with recorded arguments,
+    and in ``stub``/``verify`` modes a delivered Direction-B request must be
+    answered before the replay advances.
 
     As with :func:`replay`, break at the terminal ``ResultMessage``; the stream stays
     open after it and ends on ``disconnect()``.

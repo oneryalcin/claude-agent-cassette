@@ -19,8 +19,16 @@ import asyncio
 import json
 from pathlib import Path
 
+import posixpath
+
 import pytest
-from claude_agent_sdk import ClaudeSDKClient, ResultMessage
+from claude_agent_sdk import (
+    ClaudeAgentOptions,
+    ClaudeSDKClient,
+    PermissionResultAllow,
+    PermissionResultDeny,
+    ResultMessage,
+)
 
 from claude_agent_cassette import (
     CassetteMismatchError,
@@ -110,11 +118,12 @@ async def test_wrong_control_call_at_sync_point_fails_closed():
 
     async def scenario() -> None:
         async with replay_tape(_stop_tape(), sync_timeout=2) as client:
-            count = 0
+            events = 0
             async for message in client.receive_messages():
-                count += 1
-                if count == 9:  # past the recorded stream events, at the sync point
-                    await client.set_model("claude-haiku-4-5-20251001")
+                if type(message).__name__ == "StreamEvent":
+                    events += 1
+                    if events == 5:  # where the recording interrupted — call wrong
+                        await client.set_model("claude-haiku-4-5-20251001")
 
     with pytest.raises(CassetteMismatchError, match="'interrupt'.*'set_model'"):
         await asyncio.wait_for(scenario(), _TIMEOUT_S)
@@ -215,6 +224,88 @@ async def test_control_call_resolves_against_undelivered_tail():
             return await client.get_mcp_status()
 
     assert await asyncio.wait_for(scenario(), _TIMEOUT_S) == {"servers": ["recorded-answer"]}
+
+
+async def test_same_subtype_different_arguments_fails_closed():
+    """Handing the recorded success to a same-subtype call with different arguments
+    would certify a session the recording never had (review finding)."""
+    tape = [
+        _control_write("req_1_rec", "initialize"),
+        _control_read("req_1_rec", {}),
+        {
+            "dir": "write",
+            "data": json.dumps(
+                {
+                    "type": "control_request",
+                    "request_id": "req_2_rec",
+                    "request": {"subtype": "set_model", "model": "recorded-model"},
+                }
+            ),
+        },
+        _control_read("req_2_rec", {}),
+    ]
+
+    async def scenario() -> None:
+        async with replay_tape(tape, lockstep=True) as client:
+            await client.set_model("different-model")
+
+    with pytest.raises(CassetteMismatchError, match="does not match the recorded arguments"):
+        await asyncio.wait_for(scenario(), _TIMEOUT_S)
+
+
+async def test_same_subtype_same_arguments_replays():
+    """The strictness twin: matching arguments get the recorded response."""
+    tape = [
+        _control_write("req_1_rec", "initialize"),
+        _control_read("req_1_rec", {}),
+        {
+            "dir": "write",
+            "data": json.dumps(
+                {
+                    "type": "control_request",
+                    "request_id": "req_2_rec",
+                    "request": {"subtype": "set_model", "model": "recorded-model"},
+                }
+            ),
+        },
+        _control_read("req_2_rec", {}),
+    ]
+
+    async def scenario() -> None:
+        async with replay_tape(tape, lockstep=True) as client:
+            await client.set_model("recorded-model")
+
+    await asyncio.wait_for(scenario(), _TIMEOUT_S)
+
+
+async def test_direction_b_answer_is_a_sync_point():
+    """verify-mode + lockstep with a slow real callback: the result must not be
+    delivered while the decision is still pending — otherwise the consumer breaks
+    at the result, disconnect() cancels the callback task mid-flight, and verify
+    reports a false "never answered" divergence (review finding)."""
+    permission = (
+        Path(__file__).parent.parent / "examples" / "cassettes" / "permission_session.jsonl"
+    )
+
+    async def slow_recorded_policy(tool_name, tool_input, context):
+        await asyncio.sleep(0.2)  # a real policy that takes its time deciding
+        path = tool_input.get("file_path", "")
+        if path.startswith("/etc/"):
+            return PermissionResultDeny(message=f"Refusing to write to system path: {path}")
+        return PermissionResultAllow(
+            updated_input={**tool_input, "file_path": "./safe_output/" + posixpath.basename(path)}
+        )
+
+    async def scenario() -> None:
+        options = ClaudeAgentOptions(can_use_tool=slow_recorded_policy)
+        async with replay_tape(
+            load_tape(permission), options=options, mode="verify", lockstep=True
+        ) as client:
+            async for message in client.receive_messages():
+                if isinstance(message, ResultMessage):
+                    break
+
+    await asyncio.wait_for(scenario(), _TIMEOUT_S)
 
 
 async def test_response_without_preceding_request_write_fails_closed():

@@ -207,12 +207,16 @@ async def test_stop_classifies_terminal_state():
 ```
 
 Lockstep is strict (the trade against the default demux model's order-independence):
-the live session must issue control calls in recorded order. A consumer that never
-interrupts (caught after `sync_timeout`, default 5s), a control call of the wrong
-subtype at a sync point, or one issued after the tape ends raises
-`CassetteMismatchError` — never a hang, never a silently impossible ordering. Force
-either model with `replay_tape(..., lockstep=True/False)`. Recorder:
-[`examples/record_stop_session.py`](examples/record_stop_session.py).
+the live session must issue control calls in recorded order, **with recorded
+arguments** (`initialize` is exempt — its payload encodes the replay environment's
+wiring, not consumer intent). A consumer that never interrupts (caught after
+`sync_timeout`, default 5s), a control call of the wrong subtype or arguments at a
+sync point, or one issued after the tape ends raises `CassetteMismatchError` — never
+a hang, never a silently impossible ordering. In `stub`/`verify` modes, a delivered
+Direction-B request must be **answered** before the replay advances (on the real wire
+the CLI doesn't proceed past a pending decision), so the terminal result can't race a
+still-running callback. Force either model with `replay_tape(..., lockstep=True/False)`.
+Recorder: [`examples/record_stop_session.py`](examples/record_stop_session.py).
 
 ## pytest plugin (record-on-miss, VCR-style)
 
