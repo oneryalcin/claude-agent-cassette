@@ -101,3 +101,43 @@ async def _kinds_via_replay(messages):
             if type(msg).__name__ == "ResultMessage":
                 break
         return kinds
+
+
+# --- record(path, scrub): clean-exit-only auto-save, scrub before disk ---
+
+
+def test_record_path_writes_on_clean_exit(tmp_path):
+    out = tmp_path / "nested" / "session.jsonl"  # parent dirs created
+    with record(out) as tape:
+        tape.append({"dir": "read", "frame": {"type": "assistant", "cwd": "/home/alice"}})
+    saved = [json.loads(line) for line in out.read_text().splitlines()]
+    assert saved == tape
+    assert not list(out.parent.glob("*.tmp"))  # no temp-file droppings
+
+
+def test_record_path_writes_nothing_on_exception(tmp_path):
+    out = tmp_path / "session.jsonl"
+    try:
+        with record(out) as tape:
+            tape.append({"dir": "read", "frame": {"type": "assistant"}})
+            raise RuntimeError("session crashed")
+    except RuntimeError:
+        pass
+    assert not out.exists()  # a crashed session can't leave a torn fixture
+
+
+def test_record_path_scrubs_before_disk(tmp_path):
+    out = tmp_path / "session.jsonl"
+    with record(out, scrub=[("/home/alice", "<HOME>")]) as tape:
+        tape.append({"dir": "read", "frame": {"type": "assistant", "cwd": "/home/alice/p"}})
+    text = out.read_text()
+    assert "/home/alice" not in text and "<HOME>/p" in text
+    assert tape[0]["frame"]["cwd"] == "/home/alice/p"  # in-memory tape untouched
+
+
+def test_record_scrub_without_path_is_an_error():
+    import pytest
+
+    with pytest.raises(ValueError, match="requires path"):
+        with record(scrub=[("x", "y")]):
+            pass

@@ -33,8 +33,10 @@ def serialize_tape(tape: list[TapeEntry]) -> str:
 
 
 def save_tape(tape: list[TapeEntry], path: str | Path) -> None:
-    """Write a tape to a JSONL file (the inverse of :func:`load_tape`)."""
-    Path(path).write_text(serialize_tape(tape))
+    """Write a tape to a JSONL file (the inverse of :func:`load_tape`), creating parent dirs."""
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(serialize_tape(tape))
 
 
 def load_tape(path: str | Path) -> list[TapeEntry]:
