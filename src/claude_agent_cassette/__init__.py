@@ -36,7 +36,12 @@ from .drift import (
     parse_drift,
     unmodeled_fields,
 )
-from .transport import CassetteMismatchError, RecordingTransport, ReplayTransport
+from .transport import (
+    CassetteMismatchError,
+    LockstepReplayTransport,
+    RecordingTransport,
+    ReplayTransport,
+)
 
 __version__ = "0.3.0"
 
@@ -69,6 +74,7 @@ __all__ = [
     "lint_tape",
     # transport-level integration
     "ReplayTransport",
+    "LockstepReplayTransport",
     "RecordingTransport",
     "CassetteMismatchError",
 ]

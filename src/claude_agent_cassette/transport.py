@@ -16,13 +16,14 @@ import asyncio
 import copy
 import json
 from collections import deque
-from typing import Any, Optional
+from typing import Any, AsyncIterator, Optional
 
 from claude_agent_sdk import Transport
 
 from .tape import (
     Frame,
     TapeEntry,
+    _write_payload,
     control_request_subtype,
     control_responses_by_subtype,
     direction_b_read_frames,
@@ -84,8 +85,9 @@ class ReplayTransport(Transport):
       coupled to the *recording environment's* control sequence.
 
       Ordering-sensitive control (``interrupt``), where a conversation frame must
-      land after a control exchange, needs lockstep interleaving and is out of
-      scope here — see the issue tracker.
+      land after a control exchange, needs lockstep interleaving — use
+      :class:`LockstepReplayTransport` (what :func:`~claude_agent_cassette.replay_tape`
+      auto-selects when the tape records an interrupt).
 
       **Flow-control constraint (same as the real transport):** a control method
       issued *during* replay (``client.get_mcp_status()``, ``set_model()``, …)
@@ -97,7 +99,9 @@ class ReplayTransport(Transport):
       reproduced (an undrained stdout pipe stalls the same way), not a replay
       artefact. The supported pattern is: drive ``connect()`` then drain
       ``receive_messages()`` (optionally issuing control calls from a concurrent
-      task). Removing the constraint entirely is the lockstep work (see tracker).
+      task). :class:`LockstepReplayTransport` narrows the constraint to the real
+      wire's (a response can be starved only by frames recorded *before* it,
+      never by the rest of the tape).
     """
 
     def __init__(
@@ -211,6 +215,255 @@ class ReplayTransport(Transport):
         if not self._ended:
             self._ended = True
             await self._queue.put(_END)
+
+
+class LockstepReplayTransport(Transport):
+    """Replays a duplex tape **in recorded interleaving**: reads are delivered in
+    tape order, and each recorded SDK ``control_request`` write is a *sync point*
+    — delivery pauses until the live SDK writes the matching request.
+
+    This is what ``interrupt`` needs: on the real wire the terminal result is
+    *caused by* the interrupt, so a replay that delivers it independently (the
+    :class:`ReplayTransport` demux model) can produce orderings the real system
+    cannot — e.g. a Stop session's result arriving before the Stop was issued.
+    Here the recorded response (and everything after it) is gated on the live
+    write; the live ``request_id`` is learned at the sync point and the recorded
+    ``control_response`` is remapped to it.
+
+    The walk runs *inside* ``read_messages()``, so back-pressure is the real
+    wire's: a frame is produced only when the SDK pulls it, and a control
+    response can be starved only by frames recorded **before** it (the SDK
+    routes ``control_response`` frames without buffering them), never by the
+    rest of the tape.
+
+    Recorded **Direction-B** ``control_response`` writes (the SDK answering a
+    delivered ``can_use_tool`` / ``hook_callback`` / ``mcp_message`` request) are
+    sync points too: the walk waits for the live SDK to answer that
+    ``request_id`` before advancing — on the real wire the CLI does not proceed
+    past a pending decision, and skipping the wait would let the terminal result
+    arrive while a callback task is still running (the consumer then breaks,
+    ``disconnect()`` cancels the callback, and verify mode reports a false
+    "never answered" divergence). A recorded response whose request was *not*
+    delivered (a subtype outside ``keep_subtypes``) is skipped — no live answer
+    can come.
+
+    Strict by design (the trade against the demux model's order-independence):
+    the live client must issue control calls in recorded order, with recorded
+    arguments. Fail-closed divergences, all :class:`CassetteMismatchError`:
+
+    - the live client writes a control_request whose subtype differs from the
+      recorded one at the sync point;
+    - the subtypes match but the request payloads differ (``initialize`` is
+      exempt: its payload encodes the replay environment's wiring — options,
+      hook registrations — not consumer intent; stub/verify modes check hook
+      ids separately);
+    - the recorded control_request is never issued live within ``sync_timeout``
+      seconds of the walk reaching it (and the same bound on a pending
+      Direction-B answer);
+    - a control_request is written after the tape is exhausted.
+
+    Inside a control callback the SDK converts the raised error into the failing
+    control call's exception (``interrupt()`` raises it directly); a consumer
+    blocked in ``receive_messages()`` sees it as the stream error message.
+
+    ``keep_subtypes`` selects the Direction-B view exactly as in
+    :meth:`ReplayTransport.from_tape`: ``None`` drops every inbound
+    ``control_request`` (inert), a set keeps those subtypes so the (stubbed or
+    real) callbacks fire. Early ``close()``/``end_input()`` stops the walk
+    cleanly — like the demux model, disconnecting before the tape ends is the
+    consumer's prerogative, not divergence.
+    """
+
+    def __init__(
+        self,
+        tape: list[TapeEntry],
+        keep_subtypes: set[str] | None = None,
+        sync_timeout: float = 5.0,
+    ) -> None:
+        self._tape = tape
+        self._keep_subtypes = keep_subtypes
+        self._sync_timeout = sync_timeout
+        # Live outbound control_requests, in write order; _END on close.
+        self._live_control_writes: asyncio.Queue[Any] = asyncio.Queue()
+        # request_ids of live outbound control_responses (Direction-B answers);
+        # the event wakes a walk parked on one (and on close).
+        self._live_b_response_ids: set[Any] = set()
+        self._b_response_written = asyncio.Event()
+        self._ready = False
+        self._ended = False
+        # Exposed for write-side assertions and the verify-mode comparator.
+        self.writes: list[str] = []
+
+    async def connect(self) -> None:
+        self._ready = True
+
+    def is_ready(self) -> bool:
+        return self._ready
+
+    async def write(self, data: str) -> None:
+        self.writes.append(data)
+        try:
+            message = json.loads(data)
+        except (TypeError, ValueError):
+            return
+        if not isinstance(message, dict):
+            return
+        # Conversation writes (user messages) never block or advance the walk.
+        if message.get("type") == "control_request":
+            await self._live_control_writes.put(message)
+        elif message.get("type") == "control_response":
+            self._live_b_response_ids.add((message.get("response") or {}).get("request_id"))
+            self._b_response_written.set()
+
+    async def read_messages(self) -> AsyncIterator[Frame]:
+        live_id_by_recorded: dict[Any, Any] = {}
+        delivered_b_requests: set[Any] = set()
+        for entry in self._tape:
+            if entry.get("dir") == "write":
+                recorded = _write_payload(entry)
+                if recorded is None:
+                    continue
+                if recorded.get("type") == "control_request":
+                    live = await self._matching_live_request(recorded)
+                    if live is _END:
+                        return
+                    live_id_by_recorded[recorded.get("request_id")] = live.get("request_id")
+                elif recorded.get("type") == "control_response":
+                    # The SDK's recorded answer to a Direction-B request: wait for
+                    # the live answer before advancing — unless the request was
+                    # dropped (not kept), in which case none can come.
+                    rid = (recorded.get("response") or {}).get("request_id")
+                    if rid in delivered_b_requests and not await self._live_b_answer(rid):
+                        return
+                continue
+            frame = entry.get("frame") or {}
+            frame_type = frame.get("type")
+            if frame_type == "control_response":
+                yield self._remapped_response(frame, live_id_by_recorded)
+                continue
+            if frame_type == "control_request":
+                if (
+                    self._keep_subtypes is None
+                    or control_request_subtype(frame) not in self._keep_subtypes
+                ):
+                    continue
+                delivered_b_requests.add(frame.get("request_id"))
+            yield frame
+        # Tape exhausted. Like the real wire, the stream stays open until the
+        # client disconnects — but a further control_request has no recorded
+        # answer, so fail closed instead of letting the call hit the SDK's 60s
+        # control timeout.
+        while True:
+            live = await self._live_control_writes.get()
+            if live is _END:
+                return
+            raise CassetteMismatchError(
+                f"cassette mismatch: live control_request "
+                f"{control_request_subtype(live)!r} after the tape ended — no "
+                "recorded response remains"
+            )
+
+    async def _matching_live_request(self, recorded: Frame) -> Any:
+        """Block until the live SDK writes the control_request this sync point records.
+
+        Returns the live request frame (or ``_END`` if the consumer disconnected
+        while the walk waited). A different live subtype, or no live write within
+        ``sync_timeout``, is divergence.
+        """
+        subtype = control_request_subtype(recorded)
+        try:
+            live = await asyncio.wait_for(
+                self._live_control_writes.get(), self._sync_timeout
+            )
+        except asyncio.TimeoutError:
+            raise CassetteMismatchError(
+                f"cassette mismatch: tape records a control_request {subtype!r} "
+                f"here, but the live client wrote none within {self._sync_timeout}s "
+                "— the replay reached the recorded exchange and the live session "
+                "never issued it (e.g. an interrupt tape replayed by a consumer "
+                "that never calls interrupt())"
+            ) from None
+        if live is _END:
+            return live
+        live_subtype = control_request_subtype(live)
+        if live_subtype != subtype:
+            raise CassetteMismatchError(
+                f"cassette mismatch: tape records a control_request {subtype!r} "
+                f"here, but the live client wrote {live_subtype!r} — the live "
+                "control sequence diverged from the recorded order"
+            )
+        # Same subtype, different arguments is divergence too — handing the
+        # recorded success to e.g. a set_model with a different model would
+        # certify a session the recording never had. initialize is exempt: its
+        # payload encodes the replay environment's wiring (options, hook
+        # registrations), not consumer intent.
+        if subtype != "initialize":
+            recorded_args = recorded.get("request") or {}
+            live_args = live.get("request") or {}
+            if recorded_args != live_args:
+                raise CassetteMismatchError(
+                    f"cassette mismatch: live control_request {subtype!r} does "
+                    f"not match the recorded arguments — recorded "
+                    f"{recorded_args!r}, live {live_args!r}"
+                )
+        return live
+
+    async def _live_b_answer(self, request_id: Any) -> bool:
+        """Block until the live SDK writes its control_response for ``request_id``.
+
+        Returns False if the consumer disconnected while the walk waited (a clean
+        stop, mirroring the Direction-A sync). A delivered Direction-B request the
+        SDK never answers within ``sync_timeout`` is divergence — a hung or
+        cancelled callback would otherwise surface as a confusing downstream
+        failure (e.g. a false "never answered" in verify mode).
+        """
+        while request_id not in self._live_b_response_ids:
+            if self._ended:
+                return False
+            self._b_response_written.clear()
+            try:
+                await asyncio.wait_for(self._b_response_written.wait(), self._sync_timeout)
+            except asyncio.TimeoutError:
+                raise CassetteMismatchError(
+                    f"cassette mismatch: tape records the SDK's control_response "
+                    f"to Direction-B request {request_id!r} here, but the live SDK "
+                    f"wrote none within {self._sync_timeout}s — the callback never "
+                    "answered (hung, cancelled, or not invoked)"
+                ) from None
+        return True
+
+    def _remapped_response(
+        self, frame: Frame, live_id_by_recorded: dict[Any, Any]
+    ) -> Frame:
+        """The recorded Direction-A control_response, re-addressed to the live request.
+
+        The recorded ``request_id`` was minted by the *recording* session's SDK; the
+        live SDK demuxes by its own id, learned at the sync point. A response whose
+        recorded id never passed a sync point would be silently dropped by the SDK —
+        fail closed instead (a truncated or reordered tape).
+        """
+        recorded_id = (frame.get("response") or {}).get("request_id")
+        if recorded_id not in live_id_by_recorded:
+            raise CassetteMismatchError(
+                f"cassette mismatch: recorded control_response for request_id "
+                f"{recorded_id!r} has no preceding recorded control_request — "
+                "truncated or reordered tape"
+            )
+        remapped = copy.deepcopy(frame)
+        remapped["response"]["request_id"] = live_id_by_recorded[recorded_id]
+        return remapped
+
+    async def end_input(self) -> None:
+        await self._signal_end()
+
+    async def close(self) -> None:
+        await self._signal_end()
+
+    async def _signal_end(self) -> None:
+        if not self._ended:
+            self._ended = True
+            await self._live_control_writes.put(_END)
+            self._b_response_written.set()  # wake a walk parked on a Direction-B answer
 
 
 class RecordingTransport(Transport):

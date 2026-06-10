@@ -37,10 +37,17 @@ item has a tracking issue; shipped items reference the issue that tracked them.
 
 ## Planned
 
-### 1. `interrupt` lockstep ([#7](https://github.com/oneryalcin/claude-agent-cassette/issues/7))
-Ordering-sensitive Direction-A control, where a conversation frame must land
-*after* a control exchange resolves. Also lifts the flow-control constraint on
-issuing control calls while replaying tapes larger than the SDK's inbound buffer.
+### 1. `interrupt` lockstep ([#7](https://github.com/oneryalcin/claude-agent-cassette/issues/7)) — **shipped on main**
+`LockstepReplayTransport` replays a tape in **recorded interleaving**: each
+recorded SDK `control_request` write is a sync point gating everything after it
+on the matching live write. `replay_tape` auto-selects it when the tape records
+an `interrupt` (the one Direction-A subtype where ordering is load-bearing — the
+terminal result is *caused by* the Stop, so demux could deliver orderings the
+real system can't produce). Fail-closed on a never-issued or wrong-subtype live
+call and on post-tape control calls; narrows the flow-control constraint to the
+real wire's (a control response can be starved only by frames recorded before
+it, never by the rest of the tape). Fixture: a real recorded Stop session
+(`examples/record_stop_session.py`).
 
 ### 2. pytest integration ([#4](https://github.com/oneryalcin/claude-agent-cassette/issues/4)) — **shipped on main**
 `@pytest.mark.cassette("name", mode=..., timeout=...)` + `cassette` fixture
