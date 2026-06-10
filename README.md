@@ -187,6 +187,33 @@ async def test_permission_flow():
   lints whether a tape is still replayable (run it after scrubbing). See
   [`examples/record_permission_session.py`](examples/record_permission_session.py).
 
+### Interrupt replay (lockstep)
+
+`interrupt` is causally ordered on the real wire — a Stop session's terminal result is a
+*consequence* of the interrupt, so it must never be delivered before the live client
+issues one. When a tape records an `interrupt`, `replay_tape` automatically switches to
+**lockstep** delivery: reads arrive in recorded interleaving, and each recorded SDK
+`control_request` write gates everything after it on the matching live write.
+
+```python
+async def test_stop_classifies_terminal_state():
+    async with replay_tape(load_tape("stop_session.jsonl")) as client:  # lockstep auto
+        async for m in client.receive_messages():
+            if is_my_stop_condition(m):
+                await client.interrupt()        # answered from the recording
+            if type(m).__name__ == "ResultMessage":
+                assert m.subtype == "error_during_execution"  # arrives AFTER the interrupt
+                break
+```
+
+Lockstep is strict (the trade against the default demux model's order-independence):
+the live session must issue control calls in recorded order. A consumer that never
+interrupts (caught after `sync_timeout`, default 5s), a control call of the wrong
+subtype at a sync point, or one issued after the tape ends raises
+`CassetteMismatchError` — never a hang, never a silently impossible ordering. Force
+either model with `replay_tape(..., lockstep=True/False)`. Recorder:
+[`examples/record_stop_session.py`](examples/record_stop_session.py).
+
 ## pytest plugin (record-on-miss, VCR-style)
 
 Installing the package registers a pytest plugin (inert unless used). One marker
@@ -252,7 +279,7 @@ offline):
 | --- | --- |
 | `record()` | CM that wraps the SDK's transport to capture a session's full duplex wire as a tape |
 | `replay(frames, options=None)` | async CM → a connected `ClaudeSDKClient` replaying raw frames |
-| `replay_tape(tape, options=None, mode=...)` | async CM → replay a full duplex tape incl. the control plane; `ReplayMode = "inert" \| "stub" \| "verify"` |
+| `replay_tape(tape, options=None, mode=..., lockstep=None, sync_timeout=5.0)` | async CM → replay a full duplex tape incl. the control plane; `ReplayMode = "inert" \| "stub" \| "verify"`; `lockstep=None` auto-selects lockstep for interrupt tapes |
 | `save_tape(tape, path)` / `load_tape(path)` | tape I/O (JSONL) |
 | `load_frames(path)` | load a frames file for `replay()` |
 | `inbound_frames(tape)` / `conversation_frames(tape)` | derive frame views from a tape (all inbound / conversation-only) |
@@ -262,6 +289,7 @@ offline):
 | `check_drift(tape)` / `parse_drift(frames)` → `list[DriftFinding]` | drift findings vs the installed SDK |
 | `unmodeled_fields(frames)` / `field_drift(frames, baseline)` | field-level drift: recorded fields the installed SDK silently ignores |
 | `ReplayTransport(frames)` / `.from_tape(tape, keep_subtypes=None)` | the transport under `replay`/`replay_tape`, for wiring a client by hand |
+| `LockstepReplayTransport(tape, keep_subtypes=None, sync_timeout=5.0)` | recorded-interleaving replay — sync points at recorded control writes (interrupt tapes) |
 | `RecordingTransport(inner, tape)` | passive MITM tee, both directions |
 | `CassetteMismatchError` | replay diverged from the recording (always fail-closed) |
 | `TapeEntry` / `Frame` | the tape entry and raw-frame types |
@@ -294,8 +322,9 @@ See [ROADMAP.md](ROADMAP.md). Shipped: conversation replay, recording,
 **Direction-B replay for all three subtypes** (`can_use_tool` / `hook_callback` /
 `mcp_message`, in both `mode="stub"` and `mode="verify"`), and a
 **decision-preserving scrub** (`scrub_tape`), a **pytest plugin** (marker/fixture,
-record-on-miss, timeout-not-hang), and **field-level drift** (`drift --fields`).
-Next up: `interrupt` lockstep, curation tooling, assertion helpers.
+record-on-miss, timeout-not-hang), **field-level drift** (`drift --fields`), and
+**interrupt lockstep replay** (recorded interleaving, auto-selected for Stop tapes).
+Next up: curation tooling, assertion helpers.
 
 ## License
 

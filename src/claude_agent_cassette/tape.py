@@ -235,6 +235,23 @@ def direction_b_read_frames(
     return frames
 
 
+def records_interrupt(tape: list[TapeEntry]) -> bool:
+    """Whether the tape records an outbound ``interrupt`` control_request.
+
+    ``interrupt`` is the one Direction-A subtype where conversation/control
+    *ordering* is load-bearing (the terminal result is caused by the interrupt),
+    so its presence selects lockstep replay — see
+    :class:`~claude_agent_cassette.LockstepReplayTransport`.
+    """
+    for entry in tape:
+        payload = _write_payload(entry)
+        if payload is None or payload.get("type") != "control_request":
+            continue
+        if control_request_subtype(payload) == "interrupt":
+            return True
+    return False
+
+
 def recorded_hook_config(tape: list[TapeEntry]) -> Frame | None:
     """The hook structure the SDK registered at ``initialize``, or ``None`` if none.
 

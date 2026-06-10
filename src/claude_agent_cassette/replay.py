@@ -13,8 +13,8 @@ from .direction_b import (
     verify_direction_b_decisions,
     verify_initialize_hook_ids,
 )
-from .tape import Frame, TapeEntry
-from .transport import ReplayTransport
+from .tape import Frame, TapeEntry, records_interrupt
+from .transport import LockstepReplayTransport, ReplayTransport
 
 ReplayMode = Literal["inert", "stub", "verify"]
 
@@ -59,6 +59,9 @@ async def replay_tape(
     tape: list[TapeEntry],
     options: Optional[ClaudeAgentOptions] = None,
     mode: ReplayMode = "inert",
+    *,
+    lockstep: Optional[bool] = None,
+    sync_timeout: float = 5.0,
 ) -> AsyncIterator[ClaudeSDKClient]:
     """Drive a real ``ClaudeSDKClient`` over a full **duplex tape** via ``from_tape``.
 
@@ -91,6 +94,20 @@ async def replay_tape(
     surfaced on exit.) A tape carrying a Direction-B subtype with no replay support
     (one a future SDK adds) raises up front — use ``mode="inert"`` for it.
 
+    **Delivery model.** By default frames are delivered by the *demux* model
+    (order-independent: any recorded Direction-A response answers the matching live
+    request whenever it arrives) — unless the tape records an ``interrupt``, in which
+    case **lockstep** delivery is auto-selected: reads are delivered in recorded
+    interleaving and each recorded SDK control_request gates everything after it on
+    the matching live write. ``interrupt`` is causally ordered on the real wire (the
+    terminal result is a *consequence* of it), so demux could deliver an impossible
+    ordering — e.g. a Stop session's result before the consumer issues the Stop.
+    Pass ``lockstep=True``/``False`` to force either model; ``sync_timeout`` bounds
+    how long lockstep waits at a recorded control write for the live one (then
+    :class:`~claude_agent_cassette.CassetteMismatchError`, e.g. an interrupt tape
+    replayed by a consumer that never interrupts). Lockstep is strict: the live
+    session must issue control calls in recorded order.
+
     As with :func:`replay`, break at the terminal ``ResultMessage``; the stream stays
     open after it and ends on ``disconnect()``.
 
@@ -101,10 +118,19 @@ async def replay_tape(
                 if type(message).__name__ == "ResultMessage":
                     break
     """
+    use_lockstep = records_interrupt(tape) if lockstep is None else lockstep
+
+    def build_transport(keep_subtypes: Optional[set[str]] = None):
+        if use_lockstep:
+            return LockstepReplayTransport(
+                tape, keep_subtypes=keep_subtypes, sync_timeout=sync_timeout
+            )
+        return ReplayTransport.from_tape(tape, keep_subtypes=keep_subtypes)
+
     if mode in ("stub", "verify"):
         build = control_stub_bundle if mode == "stub" else control_verify_bundle
         bundle = build(tape, options)
-        transport = ReplayTransport.from_tape(tape, keep_subtypes=bundle.keep_subtypes)
+        transport = build_transport(keep_subtypes=bundle.keep_subtypes)
         client = ClaudeSDKClient(options=bundle.options, transport=transport)
         await client.connect()
         if "hook_callback" in bundle.keep_subtypes:
@@ -126,7 +152,7 @@ async def replay_tape(
     else:
         client = ClaudeSDKClient(
             options=options or ClaudeAgentOptions(),
-            transport=ReplayTransport.from_tape(tape),
+            transport=build_transport(),
         )
         await client.connect()
         try:
