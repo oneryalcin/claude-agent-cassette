@@ -7,21 +7,32 @@ bug that mocked tests can't.
 """
 
 from .record import record_sdk_wire
-from .replay import replay
+from .replay import replay, replay_tape
 from .tape import (
+    ControlExchange,
     Direction,
     RawMessage,
     TapeEntry,
     control_request_subtype,
     control_responses_by_subtype,
     conversation_messages,
+    direction_b_exchanges,
+    direction_b_read_frames,
     load_cassette,
     load_tape,
     message_frames,
     read_frames,
+    recorded_hook_config,
     replayable_messages,
     serialize_tape,
 )
+from .control_stubs import (
+    ControlReplayLedger,
+    ControlStubBundle,
+    control_stub_options,
+    direction_b_replay_findings,
+)
+from .redact import scrub_tape
 from .drift import DriftFinding, check_tape, parse_drift
 from .transport import CassetteMismatchError, RecordingTransport, ReplayTransport
 
@@ -45,6 +56,16 @@ __all__ = [
     "message_frames",
     "control_responses_by_subtype",
     "control_request_subtype",
+    "direction_b_exchanges",
+    "direction_b_read_frames",
+    "ControlExchange",
+    "recorded_hook_config",
+    "control_stub_options",
+    "ControlStubBundle",
+    "ControlReplayLedger",
+    "direction_b_replay_findings",
+    "scrub_tape",
+    "replay_tape",
     "parse_drift",
     "check_tape",
     "DriftFinding",

@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 from collections import defaultdict, deque
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple
 
 from typing_extensions import NotRequired, TypedDict
 
@@ -49,6 +49,25 @@ def read_frames(tape: list[TapeEntry]) -> list[RawMessage]:
 def control_request_subtype(frame: RawMessage) -> str | None:
     """The subtype of a control_request frame (``initialize``, ``mcp_message``, …)."""
     return (frame.get("request") or {}).get("subtype")
+
+
+def _write_payload(entry: TapeEntry) -> RawMessage | None:
+    """The parsed JSON object of an outbound ``write`` entry, or None.
+
+    Outbound frames store the raw payload *string* the SDK wrote; control-protocol
+    code needs it back as a dict. Returns None for non-``write`` entries, non-string
+    or non-JSON ``data``, or a JSON value that isn't an object.
+    """
+    if entry.get("dir") != "write":
+        return None
+    data = entry.get("data")
+    if not isinstance(data, str):
+        return None
+    try:
+        payload = json.loads(data)
+    except ValueError:
+        return None
+    return payload if isinstance(payload, dict) else None
 
 
 _CONTROL_FRAME_TYPES = ("control_request", "control_response")
@@ -91,14 +110,8 @@ def control_responses_by_subtype(tape: list[TapeEntry]) -> dict[str, deque[RawMe
     }
     by_subtype: dict[str, deque[RawMessage]] = defaultdict(deque)
     for entry in tape:
-        data = entry.get("data")
-        if entry.get("dir") != "write" or not isinstance(data, str):
-            continue
-        try:
-            request = json.loads(data)
-        except ValueError:
-            continue
-        if request.get("type") != "control_request":
+        request = _write_payload(entry)
+        if request is None or request.get("type") != "control_request":
             continue
         subtype = control_request_subtype(request)
         response = response_by_id.get(request.get("request_id"))
@@ -107,15 +120,144 @@ def control_responses_by_subtype(tape: list[TapeEntry]) -> dict[str, deque[RawMe
     return dict(by_subtype)
 
 
-def conversation_messages(tape: list[TapeEntry]) -> list[RawMessage]:
-    """The inbound frames a conversation replay needs.
+class ControlExchange(NamedTuple):
+    """One recorded Direction-B control exchange — the CLI's request and the SDK's answer.
 
-    Inbound frames minus the ``control_response`` to the initialize handshake,
-    which :class:`~claude_agent_cassette.ReplayTransport` synthesises itself on
-    replay. Control-protocol frames (``control_request`` for mcp/hooks, etc.) are
-    retained in the full tape but not in this conversation view.
+    Direction B is the mirror of Direction A: the **CLI sends a control_request to the
+    SDK** (``can_use_tool`` / ``hook_callback`` / ``mcp_message``), the SDK invokes the
+    consumer's registered callback, and writes the **decision** back. So in the tape an
+    inbound ``read`` request is paired with an outbound ``write`` response on the same
+    ``request_id``.
     """
-    return [f for f in read_frames(tape) if f.get("type") != "control_response"]
+
+    subtype: str  # the request subtype: can_use_tool / hook_callback / mcp_message
+    request: RawMessage  # the inbound control_request's ``request`` payload (tool_name, input, …)
+    decision: RawMessage  # the recorded answer — the control_response's inner ``response`` payload
+    succeeded: bool  # whether the recorded response envelope was ``success`` (vs ``error``)
+    request_id: str  # the CLI-minted id correlating request↔decision (unused for stub matching)
+
+
+def direction_b_exchanges(tape: list[TapeEntry]) -> dict[str, deque[ControlExchange]]:
+    """Recorded Direction-B exchanges, keyed by request subtype, in recorded order.
+
+    The mirror of :func:`control_responses_by_subtype`: there the SDK *sends* the
+    request (outbound write) and the CLI answers (inbound read); here the CLI sends
+    the request (inbound read) and the SDK answers (outbound write). Each inbound
+    ``control_request`` is paired with its outbound ``control_response`` by
+    ``request_id`` so a replay stub can hand back the recorded ``decision`` instead
+    of running the consumer's live callback. An inbound request with no recorded
+    response is dropped (mirrors the Direction-A helper's unmatched handling).
+
+    Matching note: the stub callbacks the SDK invokes never see ``request_id``
+    (e.g. ``can_use_tool`` gets ``(tool_name, input, context)``), so consumers
+    correlate by subtype + payload shape + order — which is why this is keyed by
+    subtype and preserves recorded order within each subtype.
+    """
+    response_by_id: dict[str, RawMessage] = {}
+    for entry in tape:
+        payload = _write_payload(entry)
+        if payload is None or payload.get("type") != "control_response":
+            continue
+        envelope = payload.get("response") or {}
+        rid = envelope.get("request_id")
+        if rid is not None:
+            response_by_id[rid] = envelope
+
+    by_subtype: dict[str, deque[ControlExchange]] = defaultdict(deque)
+    for entry in tape:
+        if entry.get("dir") != "read":
+            continue
+        frame = entry.get("frame") or {}
+        if frame.get("type") != "control_request":
+            continue
+        subtype = control_request_subtype(frame)
+        request_id = frame.get("request_id")
+        if subtype is None or request_id is None:
+            continue
+        envelope = response_by_id.get(request_id)
+        if envelope is None:
+            continue
+        by_subtype[subtype].append(
+            ControlExchange(
+                subtype=subtype,
+                request=frame.get("request") or {},
+                decision=envelope.get("response") or {},
+                succeeded=envelope.get("subtype") == "success",
+                request_id=request_id,
+            )
+        )
+    return dict(by_subtype)
+
+
+def direction_b_read_frames(
+    tape: list[TapeEntry], keep_subtypes: set[str] | None = None
+) -> list[RawMessage]:
+    """Inbound frames to feed the SDK for a **Direction-B** replay.
+
+    Conversation/system frames PLUS the inbound Direction-B ``control_request``s
+    (``can_use_tool`` / ``hook_callback`` / ``mcp_message``) — kept so the SDK
+    receives them and invokes the (stubbed) callbacks. Only ``control_response``
+    frames are dropped: those are Direction-A answers the transport delivers
+    out-of-band (the handshake / control machinery), not through the message stream.
+
+    ``keep_subtypes`` selects *which* control_request subtypes to keep: ``None``
+    (default) keeps every one; a set keeps only those subtypes and drops the rest, so
+    a Direction-B subtype with no replay stub stays inert (dropped, exactly as in
+    conversation-only replay) instead of reaching an unstubbed live callback.
+
+    Contrast :func:`replayable_messages`, which drops **all** control frames. Pair
+    this with stub callbacks built from :func:`direction_b_exchanges` so the kept
+    requests resolve to the recorded decisions instead of running live logic.
+    """
+    frames: list[RawMessage] = []
+    for frame in read_frames(tape):
+        frame_type = frame.get("type")
+        if frame_type == "control_response":
+            continue
+        if (
+            frame_type == "control_request"
+            and keep_subtypes is not None
+            and control_request_subtype(frame) not in keep_subtypes
+        ):
+            continue
+        frames.append(frame)
+    return frames
+
+
+def recorded_hook_config(tape: list[TapeEntry]) -> RawMessage | None:
+    """The hook structure the SDK registered at ``initialize``, or ``None`` if none.
+
+    Read from the recorded outbound ``initialize`` ``control_request``; shape is
+    ``{event: [{"matcher": ..., "hookCallbackIds": ["hook_0", ...]}, ...]}``. A
+    Direction-B hook replay mirrors this so the live SDK re-assigns the *same*
+    ``callback_id``s (it numbers them ``hook_0``, ``hook_1``, … in registration
+    order from a fresh counter), which is what makes the recorded ``hook_callback``
+    requests resolve to the replay stubs.
+    """
+    for entry in tape:
+        payload = _write_payload(entry)
+        if payload is None or payload.get("type") != "control_request":
+            continue
+        request = payload.get("request") or {}
+        if request.get("subtype") == "initialize":
+            return request.get("hooks")
+    return None
+
+
+def conversation_messages(tape: list[TapeEntry]) -> list[RawMessage]:
+    """The conversation-only inbound view — derive a replay cassette from a duplex tape.
+
+    Conversation/system frames only; **every** control frame is dropped:
+    ``control_response`` (Direction-A answers, which the transport handles out-of-band)
+    and ``control_request`` (Direction B — kept here would fire a consumer's callbacks
+    on replay). A synonym of :func:`replayable_messages`, exposed as the public name for
+    turning a recorded tape into a conversation cassette.
+
+    (This previously kept ``control_request`` frames, contradicting both this contract
+    and its name. For a Direction-B replay that *keeps* them, use
+    :func:`direction_b_read_frames`.)
+    """
+    return replayable_messages(tape)
 
 
 def load_cassette(path: str | Path) -> list[RawMessage]:
