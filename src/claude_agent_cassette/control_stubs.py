@@ -1,11 +1,18 @@
-"""Stub callbacks that replay recorded Direction-B decisions.
+"""Direction-B replay: stub callbacks (``mode="stub"``) and decision verification
+(``mode="verify"``).
 
-Direction-B replay needs the SDK to invoke *some* callback when it receives a
-recorded ``control_request`` — but running the consumer's live callback would
-defeat the point (real permission checks, hooks, in-process MCP execution, all
-with side effects). These builders turn the recorded decisions
+**Stub mode** needs the SDK to invoke *some* callback when it receives a recorded
+``control_request`` — but running the consumer's live callback would defeat the
+point (real permission checks, hooks, in-process MCP execution, all with side
+effects). The stub builders turn the recorded decisions
 (:func:`~claude_agent_cassette.direction_b_exchanges`) into callbacks that hand
-back the *recorded* outcome.
+back the *recorded* outcome — certifying the recorded wire, not the consumer's
+policy.
+
+**Verify mode** is the complement: the consumer's *real* callbacks answer the
+recorded requests, and :func:`verify_direction_b_decisions` diffs their answers
+against the recording at the wire — certifying that the consumer's policy still
+produces the recorded decisions.
 
 **Where divergence is surfaced.** The SDK runs each Direction-B callback inside a
 ``try/except Exception`` that converts *any* exception into a benign ``error``
@@ -32,7 +39,7 @@ from __future__ import annotations
 import dataclasses
 import json
 from collections import defaultdict, deque
-from typing import Any, Awaitable, Callable, NamedTuple
+from typing import Any, Awaitable, Callable, Iterator, NamedTuple
 
 from claude_agent_sdk import (
     ClaudeAgentOptions,
@@ -44,6 +51,7 @@ from claude_agent_sdk import (
 
 from .tape import (
     ControlExchange,
+    RawMessage,
     TapeEntry,
     control_request_subtype,
     direction_b_exchanges,
@@ -96,7 +104,7 @@ class ControlReplayLedger:
                 )
         if problems:
             raise CassetteMismatchError(
-                "Direction-B replay diverged from the recording (the SDK swallows stub "
+                "Direction-B replay diverged from the recording (the SDK swallows callback "
                 "errors into error responses, so this is surfaced on exit):\n  - "
                 + "\n  - ".join(problems)
             )
@@ -253,6 +261,17 @@ def build_hook_stubs(
     return hooks
 
 
+def _iter_write_frames(writes: list[str]) -> Iterator[RawMessage]:
+    """The parsed JSON objects of a transport's captured writes, skipping non-JSON."""
+    for data in writes:
+        try:
+            frame = json.loads(data)
+        except ValueError:
+            continue
+        if isinstance(frame, dict):
+            yield frame
+
+
 def _flatten_hook_ids(config: dict[str, Any] | None) -> list[str]:
     """The hookCallbackIds across a hook config, in event/matcher/hook order."""
     ids: list[str] = []
@@ -267,20 +286,18 @@ def verify_initialize_hook_ids(
 ) -> None:
     """Check the *live* SDK re-assigned the recorded hook ``callback_id``s — at the wire.
 
-    The hook stubs only resolve if the live SDK numbers the hooks exactly as the
-    recording did. Rather than predict the SDK's numbering (a coupling to an internal
-    that the realistic break — an SDK scheme change — would defeat), compare the
-    recorded ids against the ones in the SDK's live ``initialize`` write. A mismatch
-    (scrubbed recorded ids, or a changed SDK scheme) is recorded as divergence so the
+    The recorded ``hook_callback`` requests only route to the replay's hooks (stubs in
+    ``mode="stub"``, the consumer's real hooks in ``mode="verify"``) if the live SDK
+    numbers them exactly as the recording did. Rather than predict the SDK's numbering
+    (a coupling to an internal that the realistic break — an SDK scheme change — would
+    defeat), compare the recorded ids against the ones in the SDK's live ``initialize``
+    write. A mismatch (scrubbed recorded ids, a changed SDK scheme, or a consumer whose
+    hook structure no longer matches the recording) is recorded as divergence so the
     hooks-never-fired case surfaces with a clear message instead of a bare leftover.
     """
     recorded_ids = _flatten_hook_ids(recorded_hook_config(tape))
     live_config = None
-    for data in writes:
-        try:
-            frame = json.loads(data)
-        except ValueError:
-            continue
+    for frame in _iter_write_frames(writes):
         if frame.get("type") == "control_request" and (frame.get("request") or {}).get(
             "subtype"
         ) == "initialize":
@@ -291,7 +308,8 @@ def verify_initialize_hook_ids(
         ledger.record(
             f"hook callback ids not reproduced on replay: recorded {recorded_ids}, the live "
             f"SDK assigned {live_ids} — the recorded hook_callback requests won't resolve to "
-            "the stubs (scrubbed recording, or the SDK changed its id scheme)"
+            "the replay's hooks (scrubbed recording, a changed SDK id scheme, or a hook "
+            "structure that no longer matches the recording)"
         )
 
 
@@ -390,3 +408,117 @@ def control_stub_options(
             options = dataclasses.replace(options, hooks=hooks)  # type: ignore[arg-type]
             keep.add("hook_callback")
     return ControlStubBundle(options=options, keep_subtypes=keep, ledger=ledger)
+
+
+# --- Verify mode: run the consumer's REAL callbacks and diff their decisions
+# against the recording, at the wire. ---
+
+
+def control_verify_options(
+    tape: list[TapeEntry], base_options: ClaudeAgentOptions | None = None
+) -> ControlStubBundle:
+    """Precondition check for a Direction-B **verify** replay (``mode="verify"``).
+
+    Unlike :func:`control_stub_options`, nothing is replaced: the consumer's *real*
+    ``can_use_tool`` / ``hooks`` stay installed, the recorded Direction-B requests are
+    delivered to them, and :func:`verify_direction_b_decisions` diffs their answers
+    against the recording after replay. This builder only validates that every recorded
+    subtype has a live handler to run — a recording with permission exchanges but no
+    live ``can_use_tool`` (or hook exchanges but no live ``hooks``) is itself
+    divergence from the recorded session, surfaced up front with a clear message
+    rather than as N swallowed "callback is not provided" errors.
+
+    Fail-closed on unsupported subtypes exactly like stub mode (``mcp_message`` —
+    its responses embed environment-dependent payloads; see the tracker).
+    """
+    exchanges = direction_b_exchanges(tape)
+    unsupported = set(exchanges) - SUPPORTED_SUBTYPES
+    if unsupported:
+        raise CassetteMismatchError(
+            f"tape contains Direction-B subtype(s) not yet verifiable: {sorted(unsupported)}. "
+            "Replay with mode='inert' to play the conversation without the control plane, "
+            "or re-record without them."
+        )
+
+    options = base_options or ClaudeAgentOptions()
+    keep: set[str] = set()
+    if exchanges.get("can_use_tool"):
+        if options.can_use_tool is None:
+            raise CassetteMismatchError(
+                "tape records can_use_tool exchanges but options.can_use_tool is not set — "
+                "mode='verify' runs YOUR callback and diffs its decisions against the "
+                "recording (use mode='stub' to replay the recorded decisions instead)"
+            )
+        keep.add("can_use_tool")
+    if exchanges.get("hook_callback"):
+        if not options.hooks:
+            raise CassetteMismatchError(
+                "tape records hook_callback exchanges but options.hooks is empty — "
+                "mode='verify' runs YOUR hooks and diffs their outputs against the "
+                "recording (use mode='stub' to replay the recorded outputs instead)"
+            )
+        keep.add("hook_callback")
+    return ControlStubBundle(options=options, keep_subtypes=keep, ledger=ControlReplayLedger())
+
+
+def verify_direction_b_decisions(
+    writes: list[str], tape: list[TapeEntry], ledger: ControlReplayLedger
+) -> None:
+    """Diff the live SDK's Direction-B answers against the recorded ones — at the wire.
+
+    Verify mode replays the recorded ``control_request``s verbatim (same
+    ``request_id``s), the consumer's real callbacks answer them, and the SDK converts
+    those answers into ``control_response`` writes through its *real* conversion path
+    (``Query._handle_control_request``). So live and recorded decisions are directly
+    comparable as wire dicts, matched exactly by ``request_id`` — no shape conversion,
+    no order heuristics. Every divergence is recorded into ``ledger``:
+
+    - the live decision payload differs from the recorded one (the policy changed);
+    - the envelopes disagree — the recording has a decision but the live callback
+      raised (the SDK writes an ``error`` envelope), or vice versa. Two error
+      envelopes match without comparing messages: the contract is "the callback
+      still raises here", not the exception text;
+    - a recorded exchange the live side never answered (not delivered, or still in
+      flight at exit).
+    """
+    recorded = {
+        ex.request_id: ex
+        for group in direction_b_exchanges(tape).values()
+        for ex in group
+    }
+    live: dict[str, RawMessage] = {}
+    for frame in _iter_write_frames(writes):
+        if frame.get("type") != "control_response":
+            continue
+        envelope = frame.get("response") or {}
+        request_id = envelope.get("request_id")
+        if request_id in recorded:
+            live[request_id] = envelope
+
+    for request_id, exchange in recorded.items():
+        envelope = live.get(request_id)
+        if envelope is None:
+            ledger.record(
+                f"{exchange.subtype} {request_id!r}: never answered on replay "
+                "(request not delivered, or the callback was still in flight at exit)"
+            )
+            continue
+        live_succeeded = envelope.get("subtype") == "success"
+        if live_succeeded != exchange.succeeded:
+            recorded_kind = "a decision" if exchange.succeeded else "an error envelope"
+            live_kind = (
+                "a decision"
+                if live_succeeded
+                else f"an error ({envelope.get('error')!r})"
+            )
+            ledger.record(
+                f"{exchange.subtype} {request_id!r}: the recording has {recorded_kind} "
+                f"but your callback produced {live_kind}"
+            )
+        elif live_succeeded and (envelope.get("response") or {}) != exchange.decision:
+            ledger.record(
+                f"{exchange.subtype} {request_id!r}: your callback's decision diverged "
+                "from the recording\n"
+                f"      recorded: {json.dumps(exchange.decision, sort_keys=True)}\n"
+                f"      live:     {json.dumps(envelope.get('response') or {}, sort_keys=True)}"
+            )
