@@ -16,12 +16,16 @@ tape is still replayable.
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, Sequence
 
 from .tape import TapeEntry
 
+# One (needle, mask) substitution pair per entry — the vocabulary of scrub_tape,
+# record(scrub=...), and the pytest plugin's cassette_scrub fixture.
+Replacements = Sequence[tuple[str, str]]
 
-def _scrub_values(obj: Any, replacements: list[tuple[str, str]]) -> Any:
+
+def _scrub_values(obj: Any, replacements: Replacements) -> Any:
     """Recursively substitute needle→mask in every string value; structure untouched."""
     if isinstance(obj, str):
         for needle, mask in replacements:
@@ -34,7 +38,7 @@ def _scrub_values(obj: Any, replacements: list[tuple[str, str]]) -> Any:
     return obj
 
 
-def scrub_tape(tape: list[TapeEntry], replacements: list[tuple[str, str]]) -> list[TapeEntry]:
+def scrub_tape(tape: list[TapeEntry], replacements: Replacements) -> list[TapeEntry]:
     """A copy of ``tape`` with each ``(needle, mask)`` substring blanked in string values.
 
     ``replacements`` is applied **longest-needle-first**, so a specific path

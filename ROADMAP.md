@@ -42,11 +42,12 @@ Ordering-sensitive Direction-A control, where a conversation frame must land
 *after* a control exchange resolves. Also lifts the flow-control constraint on
 issuing control calls while replaying tapes larger than the SDK's inbound buffer.
 
-### 2. pytest integration ([#4](https://github.com/oneryalcin/claude-agent-cassette/issues/4))
-Cassette discovery + a fixture/marker (`@pytest.mark.cassette("name")`),
-**record-on-miss** ergonomics (VCR-style: replay if a recording exists, record on
-first run), and a per-test timeout default so a malformed recording fails fast
-instead of hanging.
+### 2. pytest integration ([#4](https://github.com/oneryalcin/claude-agent-cassette/issues/4)) — **shipped on main**
+`@pytest.mark.cassette("name", mode=..., timeout=...)` + `cassette` fixture
+(`await cassette.run(prompt)` → typed messages); **record-on-miss** behind
+`--record-cassettes` (a missing cassette *fails* without the flag, so CI never
+records; recordings are scrubbed before disk via the `cassette_scrub` fixture);
+timeout-not-hang on truncated recordings (`cassette_timeout` ini).
 
 ### 3. Field-level drift ([#9](https://github.com/oneryalcin/claude-agent-cassette/issues/9))
 Today's drift check is parse-level (rejected/skipped frames + dropped content

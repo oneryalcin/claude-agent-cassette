@@ -27,7 +27,7 @@ from .tape import (
     save_tape,
 )
 from .direction_b import lint_tape
-from .scrub import scrub_tape
+from .scrub import Replacements, scrub_tape
 from .drift import DriftFinding, DriftReason, check_drift, parse_drift
 from .transport import CassetteMismatchError, RecordingTransport, ReplayTransport
 
@@ -50,6 +50,7 @@ __all__ = [
     "direction_b_exchanges",
     "ControlExchange",
     "scrub_tape",
+    "Replacements",
     # tape health: drift (does the installed SDK still parse it?) and
     # replayability (is it still Direction-B replayable after a scrub?)
     "check_drift",

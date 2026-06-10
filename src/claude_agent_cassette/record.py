@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
-from .scrub import scrub_tape
+from .scrub import Replacements, scrub_tape
 from .tape import TapeEntry, serialize_tape
 from .transport import RecordingTransport
 
@@ -16,7 +16,7 @@ from .transport import RecordingTransport
 @contextmanager
 def record(
     path: str | Path | None = None,
-    scrub: list[tuple[str, str]] | None = None,
+    scrub: Replacements | None = None,
 ) -> Iterator[list[TapeEntry]]:
     """Tee the SDK wire for any query run inside the ``with`` block.
 
