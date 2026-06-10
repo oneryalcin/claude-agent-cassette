@@ -15,7 +15,10 @@ tape is still replayable.
 
 from __future__ import annotations
 
+import copy
 import json
+import os
+import re
 from typing import Any, Sequence
 
 from .tape import TapeEntry
@@ -23,6 +26,37 @@ from .tape import TapeEntry
 # One (needle, mask) substitution pair per entry — the vocabulary of scrub_tape,
 # record(scrub=...), and the pytest plugin's cassette_scrub fixture.
 Replacements = Sequence[tuple[str, str]]
+
+
+def path_replacements(path: str, mask: str) -> list[tuple[str, str]]:
+    """Every wire form of ``path`` as (needle, mask) pairs: raw, realpath, and the
+    CLI's **slug encoding**.
+
+    The CLI embeds paths slug-encoded (every non-alphanumeric character becomes
+    ``-``) in ``~/.claude/projects/<slug>/…`` strings — ``system/init.memory_paths``,
+    hook-input ``transcript_path``. A literal substring scrub can never match the
+    slug (``/Users/alice/proj`` rides the wire as ``-Users-alice-proj``), so a
+    path's slug forms must be needles of their own.
+    """
+    slug = re.sub(r"[^A-Za-z0-9]", "-", path)
+    real = os.path.realpath(path)
+    pairs = [(path, mask), (real, mask), (slug, mask)]
+    if real != path:
+        pairs.append((re.sub(r"[^A-Za-z0-9]", "-", real), mask))
+    return pairs
+
+
+def default_replacements() -> list[tuple[str, str]]:
+    """The standard recording scrub: cwd, home (raw + realpath + slug forms), and
+    ``ANTHROPIC_API_KEY``. Extend with :func:`path_replacements` for other
+    recording-specific paths (a temp cwd, an isolated ``CLAUDE_CONFIG_DIR``)."""
+    pairs = path_replacements(os.getcwd(), "<CWD>") + path_replacements(
+        os.path.expanduser("~"), "<HOME>"
+    )
+    key = os.environ.get("ANTHROPIC_API_KEY")
+    if key:
+        pairs.append((key, "<REDACTED_API_KEY>"))
+    return pairs
 
 
 def _scrub_values(obj: Any, replacements: Replacements) -> Any:
@@ -65,12 +99,15 @@ def scrub_tape(tape: list[TapeEntry], replacements: Replacements) -> list[TapeEn
     return scrubbed
 
 
-# The system/init keys that list the recording environment's inventory. Names of
-# slash commands, plugins, skills, agents, MCP servers, memory files, and tools
+# The keys that enumerate the recording environment's inventory, at the two
+# places the CLI emits it: the ``system/init`` conversation frame, and the
+# ``initialize`` handshake's control_response (``response.response``). Names of
+# slash commands, plugins, skills, agents, MCP servers, memory paths, and tools
 # fingerprint the operator's machine (or a company's internal tooling) — and for
 # replay they are inert: the SDK keeps the init frame wholesale as
-# SystemMessage.data without reading them, so blanking is decision-preserving by
-# construction.
+# SystemMessage.data and only surfaces the handshake result via
+# ``get_server_info()``, without reading these keys, so blanking is
+# decision-preserving by construction.
 _INIT_INVENTORY_KEYS = (
     "slash_commands",
     "plugins",
@@ -80,36 +117,71 @@ _INIT_INVENTORY_KEYS = (
     "memory_paths",
     "tools",
 )
+_HANDSHAKE_INVENTORY_KEYS = (
+    "commands",
+    "agents",
+    "models",
+    "available_output_styles",
+    "account",
+)
+
+
+def _blank(value: Any) -> Any:
+    """Type-preserving blank: a list empties to [], a dict to {} (memory_paths is
+    a dict on current CLIs), anything else passes through."""
+    if isinstance(value, list):
+        return []
+    if isinstance(value, dict):
+        return {}
+    return value
 
 
 def scrub_init_inventory(tape: list[TapeEntry]) -> list[TapeEntry]:
-    """A copy of ``tape`` with the environment inventory in ``system/init`` frames blanked.
+    """A copy of ``tape`` with the recording environment's inventory blanked.
 
-    The CLI's ``system/init`` frame enumerates the recording environment — every
-    slash command, plugin (with cache paths), skill, agent, connected MCP server,
-    memory path, and tool name. :func:`scrub_tape` masks *values* you name; this
-    blanks those inventory **lists** to ``[]`` wholesale, for tapes recorded in
-    real environments where the inventory itself is the leak.
+    The CLI enumerates the environment in two frames: ``system/init`` (slash
+    commands, plugins with cache paths, skills, agents, MCP servers, memory
+    paths, tool names) and the ``initialize`` handshake's ``control_response``
+    (command/agent/model inventories, account metadata). :func:`scrub_tape`
+    masks *values* you name; this blanks those inventory containers wholesale,
+    for tapes recorded in real environments where the inventory itself is the
+    leak.
 
-    Keys are blanked only where present and list-valued (structure and types are
-    preserved; nothing is dropped or reshaped). The best fix is recording in an
-    isolated environment in the first place (``env={"CLAUDE_CONFIG_DIR": ...}`` —
-    see ``examples/record_stop_session.py``); this is the after-the-fact repair.
+    Keys are blanked only where present, type-preserved (list → ``[]``, dict →
+    ``{}``); nothing is dropped or reshaped, and no other frame is touched —
+    Direction-B decision writes in particular ride through untouched. The best
+    fix is recording in an isolated environment in the first place
+    (``env={"CLAUDE_CONFIG_DIR": ...}`` — see the example recorders, which apply
+    both); this is the after-the-fact repair.
+
+    Note: paths *outside* these inventory keys (a hook input's
+    ``transcript_path``, the slug-encoded project dir) are value scrubs —
+    :func:`scrub_tape` with :func:`default_replacements` /
+    :func:`path_replacements` covers them. ``claude_code_version`` /
+    ``apiKeySource`` / ``session_id`` / ``uuid`` are deliberately kept: not
+    operator-identifying (random or generic), and version is load-bearing
+    context for drift triage.
     """
+    # deepcopy up front: like scrub_tape, the result must share NO substructure
+    # with the input — a caller mutating the scrubbed copy must not corrupt the
+    # original recording.
     scrubbed: list[TapeEntry] = []
-    for entry in tape:
+    for entry in copy.deepcopy(tape):
         frame = entry.get("frame")
-        if (
-            entry.get("dir") == "read"
-            and isinstance(frame, dict)
-            and frame.get("type") == "system"
-            and frame.get("subtype") == "init"
-        ):
-            blanked = {
-                k: ([] if k in _INIT_INVENTORY_KEYS and isinstance(v, list) else v)
-                for k, v in frame.items()
-            }
-            scrubbed.append({"dir": "read", "frame": blanked})
-        else:
+        if entry.get("dir") != "read" or not isinstance(frame, dict):
             scrubbed.append(entry)
+            continue
+        if frame.get("type") == "system" and frame.get("subtype") == "init":
+            for key in _INIT_INVENTORY_KEYS:
+                if key in frame:
+                    frame[key] = _blank(frame[key])
+            scrubbed.append(entry)
+            continue
+        if frame.get("type") == "control_response":
+            inner = (frame.get("response") or {}).get("response")
+            if isinstance(inner, dict):
+                for key in _HANDSHAKE_INVENTORY_KEYS:
+                    if key in inner:
+                        inner[key] = _blank(inner[key])
+        scrubbed.append(entry)
     return scrubbed

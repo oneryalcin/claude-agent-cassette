@@ -19,14 +19,21 @@ Run (spends a small API call; needs ANTHROPIC_API_KEY + the bundled claude CLI):
 from __future__ import annotations
 
 import asyncio
+import getpass
 import json
-import os
 import tempfile
 from pathlib import Path
 
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
 
-from claude_agent_cassette import record, save_tape, scrub_tape
+from claude_agent_cassette import (
+    default_replacements,
+    path_replacements,
+    record,
+    save_tape,
+    scrub_init_inventory,
+    scrub_tape,
+)
 
 _OUT = Path(__file__).parent / "cassettes" / "stop_session.jsonl"
 # Pin a non-Covered (zero-data-retention-OK) model: the default rotated to Fable 5,
@@ -44,17 +51,18 @@ _PROMPT = (
 _EVENTS_BEFORE_INTERRUPT = 5
 
 
-def _pii_replacements() -> list[tuple[str, str]]:
-    """The (needle, mask) pairs that blank this recording's filesystem fingerprint."""
-    replacements = [
-        (os.path.realpath(os.getcwd()), "<CWD>"),
-        (os.getcwd(), "<CWD>"),
-        (os.path.expanduser("~"), "<HOME>"),
-    ]
-    key = os.environ.get("ANTHROPIC_API_KEY")
-    if key:
-        replacements.append((key, "<REDACTED_API_KEY>"))
-    return replacements
+def _replacements(config_dir: str, cwd: str) -> list[tuple[str, str]]:
+    """The recording's full fingerprint: cwd/home/key (raw + slug forms via the
+    library defaults), the recording-specific dirs, the whole temp root (its path
+    embeds a stable per-user hash on macOS), and the bare username (tool output
+    like ``ls -la`` prints it outside any path)."""
+    return (
+        default_replacements()
+        + path_replacements(cwd, "<CWD>")
+        + path_replacements(config_dir, "<CONFIG>")
+        + path_replacements(tempfile.gettempdir(), "<TMP>")
+        + [(getpass.getuser(), "<USER>")]
+    )
 
 
 def _summary(scrubbed: list[dict]) -> None:
@@ -96,29 +104,31 @@ async def main() -> None:
     # recorded system/init inventory (slash commands, plugins, skills, MCP servers,
     # hooks) is the CLI's builtin baseline, not this machine's fingerprint.
     config_dir = tempfile.mkdtemp(prefix="cassette-clean-config-")
-    options = ClaudeAgentOptions(
-        model=_MODEL,
-        include_partial_messages=True,
-        env={"CLAUDE_CONFIG_DIR": config_dir},
-    )
-    print("Recording stop session ...\n")
-    with record() as tape:
-        async with ClaudeSDKClient(options) as client:
-            await client.query(_PROMPT)
-            events = 0
-            interrupted = False
-            async for message in client.receive_messages():
-                name = type(message).__name__
-                if name == "StreamEvent":
-                    events += 1
-                    if events >= _EVENTS_BEFORE_INTERRUPT and not interrupted:
-                        interrupted = True
-                        print(f"... interrupting after {events} stream events")
-                        await client.interrupt()
-                if name == "ResultMessage":
-                    break
+    with tempfile.TemporaryDirectory() as cwd:
+        options = ClaudeAgentOptions(
+            model=_MODEL,
+            include_partial_messages=True,
+            cwd=cwd,  # never the operator's project dir (it rides the wire slug-encoded)
+            env={"CLAUDE_CONFIG_DIR": config_dir},
+        )
+        print("Recording stop session ...\n")
+        with record() as tape:
+            async with ClaudeSDKClient(options) as client:
+                await client.query(_PROMPT)
+                events = 0
+                interrupted = False
+                async for message in client.receive_messages():
+                    name = type(message).__name__
+                    if name == "StreamEvent":
+                        events += 1
+                        if events >= _EVENTS_BEFORE_INTERRUPT and not interrupted:
+                            interrupted = True
+                            print(f"... interrupting after {events} stream events")
+                            await client.interrupt()
+                    if name == "ResultMessage":
+                        break
 
-    scrubbed = scrub_tape(tape, _pii_replacements())
+        scrubbed = scrub_init_inventory(scrub_tape(tape, _replacements(config_dir, cwd)))
     save_tape(scrubbed, _OUT)
     print(f"\nWrote {len(scrubbed)} frames -> {_OUT}")
     _summary(scrubbed)

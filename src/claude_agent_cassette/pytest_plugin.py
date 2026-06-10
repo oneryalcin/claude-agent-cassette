@@ -45,7 +45,7 @@ from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, Message, Resul
 
 from .record import record
 from .replay import ReplayMode, replay, replay_tape
-from .scrub import Replacements
+from .scrub import Replacements, default_replacements
 from .tape import load_tape
 
 _HELP_RECORD = "record missing cassettes by running real sessions (spends API calls)"
@@ -151,13 +151,14 @@ def cassette_options() -> ClaudeAgentOptions | None:
 
 @pytest.fixture
 def cassette_scrub() -> Replacements:
-    """The (needle, mask) pairs applied before a recording touches disk. Override to extend."""
-    cwd = os.getcwd()
-    pairs = [(os.path.realpath(cwd), "<CWD>"), (cwd, "<CWD>"), (os.path.expanduser("~"), "<HOME>")]
-    key = os.environ.get("ANTHROPIC_API_KEY")
-    if key:
-        pairs.append((key, "<REDACTED_API_KEY>"))
-    return pairs
+    """The (needle, mask) pairs applied before a recording touches disk. Override to extend.
+
+    Defaults to :func:`~claude_agent_cassette.default_replacements` — cwd, home,
+    and the API key, in raw, realpath, AND the CLI's slug-encoded path forms (the
+    project dir rides the wire as ``-Users-alice-proj`` inside
+    ``~/.claude/projects/…`` strings, which a literal path needle can't match).
+    """
+    return default_replacements()
 
 
 @pytest.fixture

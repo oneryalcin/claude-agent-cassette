@@ -44,7 +44,14 @@ from claude_agent_sdk import (
     ToolPermissionContext,
 )
 
-from claude_agent_cassette import record, save_tape, scrub_tape
+from claude_agent_cassette import (
+    default_replacements,
+    path_replacements,
+    record,
+    save_tape,
+    scrub_init_inventory,
+    scrub_tape,
+)
 
 _OUT = Path(__file__).parent / "cassettes" / "permission_session.jsonl"
 # Pin a non-Covered (zero-data-retention-OK) model: the default rotated to Fable 5,
@@ -103,17 +110,20 @@ async def deterministic_permission(
     return PermissionResultDeny(message=f"Tool not permitted in recording: {tool_name}")
 
 
-def _pii_replacements(cwd: str) -> list[tuple[str, str]]:
-    """The (needle, mask) pairs that blank this recording's filesystem fingerprint."""
-    replacements = [
-        (os.path.realpath(cwd), "<CWD>"),
-        (cwd, "<CWD>"),
-        (os.path.expanduser("~"), "<HOME>"),
-    ]
-    key = os.environ.get("ANTHROPIC_API_KEY")
-    if key:
-        replacements.append((key, "<REDACTED_API_KEY>"))
-    return replacements
+def _replacements(config_dir: str, cwd: str) -> list[tuple[str, str]]:
+    """The recording's full fingerprint: cwd/home/key (raw + slug forms via the
+    library defaults), the recording-specific dirs, the whole temp root (its path
+    embeds a stable per-user hash on macOS), and the bare username (tool output
+    like ``ls -la`` prints it outside any path)."""
+    import getpass
+
+    return (
+        default_replacements()
+        + path_replacements(cwd, "<CWD>")
+        + path_replacements(config_dir, "<CONFIG>")
+        + path_replacements(tempfile.gettempdir(), "<TMP>")
+        + [(getpass.getuser(), "<USER>")]
+    )
 
 
 def _summary(scrubbed: list[dict]) -> None:
@@ -163,7 +173,7 @@ async def main() -> None:
                     if type(message).__name__ == "ResultMessage":
                         break
 
-        scrubbed = scrub_tape(tape, _pii_replacements(cwd))
+        scrubbed = scrub_init_inventory(scrub_tape(tape, _replacements(config_dir, cwd)))
         _OUT.parent.mkdir(parents=True, exist_ok=True)
         save_tape(scrubbed, _OUT)
         print(f"\nWrote {len(scrubbed)} frames -> {_OUT}")

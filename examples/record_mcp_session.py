@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -33,7 +32,14 @@ from claude_agent_sdk import (
     tool,
 )
 
-from claude_agent_cassette import record, save_tape, scrub_tape
+from claude_agent_cassette import (
+    default_replacements,
+    path_replacements,
+    record,
+    save_tape,
+    scrub_init_inventory,
+    scrub_tape,
+)
 
 _OUT = Path(__file__).parent / "cassettes" / "mcp_session.jsonl"
 # Pin a non-Covered (zero-data-retention-OK) model: the default rotated to Fable 5,
@@ -66,17 +72,20 @@ async def divide_numbers(args: dict[str, Any]) -> dict[str, Any]:
     return {"content": [{"type": "text", "text": f"{args['a']} / {args['b']} = {result}"}]}
 
 
-def _pii_replacements() -> list[tuple[str, str]]:
-    """The (needle, mask) pairs that blank this recording's filesystem fingerprint."""
-    replacements = [
-        (os.path.realpath(os.getcwd()), "<CWD>"),
-        (os.getcwd(), "<CWD>"),
-        (os.path.expanduser("~"), "<HOME>"),
-    ]
-    key = os.environ.get("ANTHROPIC_API_KEY")
-    if key:
-        replacements.append((key, "<REDACTED_API_KEY>"))
-    return replacements
+def _replacements(config_dir: str, cwd: str) -> list[tuple[str, str]]:
+    """The recording's full fingerprint: cwd/home/key (raw + slug forms via the
+    library defaults), the recording-specific dirs, the whole temp root (its path
+    embeds a stable per-user hash on macOS), and the bare username (tool output
+    like ``ls -la`` prints it outside any path)."""
+    import getpass
+
+    return (
+        default_replacements()
+        + path_replacements(cwd, "<CWD>")
+        + path_replacements(config_dir, "<CONFIG>")
+        + path_replacements(tempfile.gettempdir(), "<TMP>")
+        + [(getpass.getuser(), "<USER>")]
+    )
 
 
 def _summary(scrubbed: list[dict]) -> None:
@@ -115,22 +124,24 @@ async def main() -> None:
     # recorded system/init inventory (slash commands, plugins, skills, MCP servers,
     # hooks) is the CLI's builtin baseline, not this machine's fingerprint.
     config_dir = tempfile.mkdtemp(prefix="cassette-clean-config-")
-    options = ClaudeAgentOptions(
-        mcp_servers={"calc": calculator},
-        # Pre-approve the tools so the tape stays mcp_message-only (no can_use_tool).
-        allowed_tools=["mcp__calc__add", "mcp__calc__divide"],
-        model=_MODEL,
-        env={"CLAUDE_CONFIG_DIR": config_dir},
-    )
-    print("Recording mcp session ...\n")
-    with record() as tape:
-        async with ClaudeSDKClient(options) as client:
-            await client.query(_PROMPT)
-            async for message in client.receive_response():
-                if type(message).__name__ == "ResultMessage":
-                    break
+    with tempfile.TemporaryDirectory() as cwd:
+        options = ClaudeAgentOptions(
+            mcp_servers={"calc": calculator},
+            # Pre-approve the tools so the tape stays mcp_message-only (no can_use_tool).
+            allowed_tools=["mcp__calc__add", "mcp__calc__divide"],
+            model=_MODEL,
+            cwd=cwd,  # never the operator's project dir (it rides the wire slug-encoded)
+            env={"CLAUDE_CONFIG_DIR": config_dir},
+        )
+        print("Recording mcp session ...\n")
+        with record() as tape:
+            async with ClaudeSDKClient(options) as client:
+                await client.query(_PROMPT)
+                async for message in client.receive_response():
+                    if type(message).__name__ == "ResultMessage":
+                        break
 
-    scrubbed = scrub_tape(tape, _pii_replacements())
+        scrubbed = scrub_init_inventory(scrub_tape(tape, _replacements(config_dir, cwd)))
     _OUT.parent.mkdir(parents=True, exist_ok=True)
     save_tape(scrubbed, _OUT)
     print(f"\nWrote {len(scrubbed)} frames -> {_OUT}")
