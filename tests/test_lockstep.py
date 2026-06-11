@@ -22,6 +22,7 @@ from pathlib import Path
 import posixpath
 
 import pytest
+from claude_agent_sdk import types as sdk_types
 from claude_agent_sdk import (
     ClaudeAgentOptions,
     ClaudeSDKClient,
@@ -32,6 +33,7 @@ from claude_agent_sdk import (
 
 from claude_agent_cassette import (
     CassetteMismatchError,
+    LockstepReplayTransport,
     load_tape,
     replay_tape,
 )
@@ -181,11 +183,15 @@ async def test_direction_b_stub_replay_identical_under_lockstep():
     )
 
 
-def _control_write(request_id: str, subtype: str) -> dict:
+def _control_write(request_id: str, subtype: str, **request_args: str) -> dict:
     return {
         "dir": "write",
         "data": json.dumps(
-            {"type": "control_request", "request_id": request_id, "request": {"subtype": subtype}}
+            {
+                "type": "control_request",
+                "request_id": request_id,
+                "request": {"subtype": subtype, **request_args},
+            }
         ),
     }
 
@@ -321,4 +327,265 @@ async def test_response_without_preceding_request_write_fails_closed():
             pass
 
     with pytest.raises(CassetteMismatchError, match="req_OTHER"):
+        await asyncio.wait_for(scenario(), _TIMEOUT_S)
+
+
+# --- tolerate_subtypes: foreign tapes vs consumer side-calls (issue #30) ---
+#
+# A tape is not consumer-neutral: a consumer whose connect/turn path adds its
+# own read-only side-calls (a get_mcp_status() health check) can never replay a
+# tape recorded by a different consumer — strict lockstep fails closed on the
+# first unrecorded call. tolerate_subtypes answers those synthetically, governed
+# by the remaining tape (a subtype the tape still records is never tolerated).
+
+
+async def _health_check_then_drain(tolerate) -> tuple[dict, list[str]]:
+    """The motivating consumer shape (desia-task-service): get_mcp_status()
+    awaited *before* any draining — exactly what a connect()-time health check
+    does — then the normal drain-and-interrupt of the Stop fixture."""
+    seen: list[str] = []
+    async with replay_tape(_stop_tape(), tolerate_subtypes=tolerate) as client:
+        status = await client.get_mcp_status()
+        events = 0
+        async for message in client.receive_messages():
+            seen.append(type(message).__name__)
+            if type(message).__name__ == "StreamEvent":
+                events += 1
+                if events == 5:
+                    await client.interrupt()
+            if isinstance(message, ResultMessage):
+                break
+    return status, seen
+
+
+async def test_foreign_tape_side_call_answered_synthetically():
+    """A consumer health-checking on connect must be able to replay a foreign
+    interrupt tape: the unrecorded mcp_status gets a synthetic empty answer
+    (never recorded data) and the replay then completes in recorded order."""
+    status, seen = await asyncio.wait_for(
+        _health_check_then_drain({"mcp_status"}), _TIMEOUT_S
+    )
+    assert status == {"mcpServers": []}
+    assert seen[-1] == "ResultMessage"
+
+
+async def test_side_call_tolerance_defaults_off():
+    """Tolerance is opt-in — without it the same consumer fails closed, so a
+    gate can never silently absorb an unrecorded control call."""
+    with pytest.raises(CassetteMismatchError, match="'interrupt'.*'mcp_status'"):
+        await asyncio.wait_for(_health_check_then_drain(None), _TIMEOUT_S)
+
+
+async def test_intent_bearing_subtype_rejected_at_construction():
+    """Synthetically answering an intent-bearing call (interrupt, set_model)
+    would certify a session the recording never had — refused up front, not at
+    some later sync point."""
+    with pytest.raises(ValueError, match="interrupt"):
+        LockstepReplayTransport([], tolerate_subtypes={"interrupt"})
+
+
+async def test_tolerated_subtype_recorded_later_is_not_stolen():
+    """The remaining tape is the arbiter: a live call of a tolerated subtype the
+    tape records *later* must not be answered synthetically — that would consume
+    the write its recorded sync point is waiting for and orphan it. Issuing it
+    before the recorded order is a true divergence."""
+    tape = [
+        _control_write("req_1_rec", "initialize"),
+        _control_read("req_1_rec", {}),
+        _control_write("req_2_rec", "set_model", model="recorded-model"),
+        _control_read("req_2_rec", {}),
+        _control_write("req_3_rec", "mcp_status"),
+        _control_read("req_3_rec", {"mcpServers": [{"name": "recorded"}]}),
+    ]
+
+    async def scenario() -> None:
+        async with replay_tape(
+            tape, lockstep=True, sync_timeout=2, tolerate_subtypes={"mcp_status"}
+        ) as client:
+            await client.get_mcp_status()  # before the recorded set_model
+
+    with pytest.raises(CassetteMismatchError, match="'set_model'.*'mcp_status'"):
+        await asyncio.wait_for(scenario(), _TIMEOUT_S)
+
+
+async def test_recorded_sync_of_tolerated_subtype_still_replays_recorded_content():
+    """Tolerance never shadows the tape: when the tape records the subtype at
+    this position, strict matching wins and the consumer gets the *recorded*
+    response, not the synthetic empty one."""
+    tape = [
+        _control_write("req_1_rec", "initialize"),
+        _control_read("req_1_rec", {}),
+        _control_write("req_2_rec", "mcp_status"),
+        _control_read("req_2_rec", {"mcpServers": [{"name": "recorded"}]}),
+    ]
+
+    async def scenario() -> dict:
+        async with replay_tape(
+            tape, lockstep=True, tolerate_subtypes={"mcp_status"}
+        ) as client:
+            return await client.get_mcp_status()
+
+    status = await asyncio.wait_for(scenario(), _TIMEOUT_S)
+    assert status == {"mcpServers": [{"name": "recorded"}]}
+
+
+async def test_post_tape_side_call_tolerated():
+    """A consumer may health-check again after the recorded session ended — the
+    post-tape fail-closed loop applies the same tolerance."""
+
+    async def scenario() -> dict:
+        async with replay_tape(
+            _stop_tape(), tolerate_subtypes={"mcp_status"}
+        ) as client:
+            events = 0
+            async for message in client.receive_messages():
+                if type(message).__name__ == "StreamEvent":
+                    events += 1
+                    if events == 5:
+                        await client.interrupt()
+                if isinstance(message, ResultMessage):
+                    break
+            return await client.get_mcp_status()
+
+    assert await asyncio.wait_for(scenario(), _TIMEOUT_S) == {"mcpServers": []}
+
+
+async def test_get_context_usage_canned_shape_is_consumable():
+    """The synthetic get_context_usage answer must carry every required key of
+    the SDK's ContextUsageResponse — a missing one surfaces as a consumer
+    KeyError on a tolerated call. Asserted against the *installed* SDK's
+    TypedDict so the CI matrix turns an SDK bump that adds a required key into
+    a signal (review finding)."""
+    tape = [
+        _control_write("req_1_rec", "initialize"),
+        _control_read("req_1_rec", {}),
+        _control_write("req_2_rec", "interrupt"),
+        _control_read("req_2_rec", {}),
+    ]
+
+    async def scenario() -> dict:
+        async with replay_tape(
+            tape, lockstep=True, tolerate_subtypes={"get_context_usage"}
+        ) as client:
+            usage = await client.get_context_usage()
+            await client.interrupt()
+            return usage
+
+    usage = await asyncio.wait_for(scenario(), _TIMEOUT_S)
+    response_type = getattr(sdk_types, "ContextUsageResponse", None)
+    if response_type is not None:  # SDK versions in the matrix may predate it
+        assert set(usage) >= response_type.__required_keys__
+    assert usage["percentage"] == 0.0
+    assert usage["categories"] == []
+
+
+async def test_subtype_becomes_tolerable_once_its_recorded_sync_passes():
+    """The enabling half of decrement-after-match: a second live call of a
+    subtype the tape recorded *once* must be tolerated after that sync passes —
+    without the decrement, the stale count holds the call for matching and the
+    next sync point reports a false divergence (mutation-testing finding)."""
+    tape = [
+        _control_write("req_1_rec", "initialize"),
+        _control_read("req_1_rec", {}),
+        _control_write("req_2_rec", "mcp_status"),
+        _control_read("req_2_rec", {"mcpServers": [{"name": "recorded"}]}),
+        _control_write("req_3_rec", "interrupt"),
+        _control_read("req_3_rec", {}),
+    ]
+
+    async def scenario() -> tuple[dict, dict]:
+        async with replay_tape(
+            tape, lockstep=True, tolerate_subtypes={"mcp_status"}
+        ) as client:
+            first = await client.get_mcp_status()  # matches the recorded sync
+            second = await client.get_mcp_status()  # past it — tolerated
+            await client.interrupt()
+            return first, second
+
+    first, second = await asyncio.wait_for(scenario(), _TIMEOUT_S)
+    assert first == {"mcpServers": [{"name": "recorded"}]}
+    assert second == {"mcpServers": []}
+
+
+async def test_side_call_resolves_during_long_pre_sync_section():
+    """The adversarial-review regression: a connect-time health check on a tape
+    with more pre-sync frames than the SDK's inbound buffer (100). The walker
+    suspends on backpressure long before the next sync point, so a park-only
+    tolerance never answers and the blocked consumer deadlocks — the call must
+    be serviced while the walk is still pumping the section."""
+    tape = [_control_write("req_1_rec", "initialize"), _control_read("req_1_rec", {})]
+    tape += [
+        {"dir": "read", "frame": {"type": "system", "subtype": "status", "i": i}}
+        for i in range(130)
+    ]
+    tape += [_control_write("req_2_rec", "interrupt"), _control_read("req_2_rec", {})]
+
+    async def scenario() -> dict:
+        async with replay_tape(
+            tape, lockstep=True, tolerate_subtypes={"mcp_status"}
+        ) as client:
+            status = await client.get_mcp_status()  # before any draining
+            count = 0
+            async for _message in client.receive_messages():
+                count += 1
+                if count == 130:
+                    await client.interrupt()
+                    break
+            return status
+
+    assert await asyncio.wait_for(scenario(), _TIMEOUT_S) == {"mcpServers": []}
+
+
+async def test_direction_b_park_services_tolerated_side_calls():
+    """A can_use_tool callback that health-checks before deciding: the walk is
+    parked on the pending Direction-B answer, which the callback can't produce
+    until its tolerated side-call is answered. Pre-fix this starved until
+    sync_timeout and surfaced as a misleading "callback never answered"
+    divergence (review finding)."""
+    permission = (
+        Path(__file__).parent.parent / "examples" / "cassettes" / "permission_session.jsonl"
+    )
+    holder: dict = {}
+    statuses: list[dict] = []
+
+    async def health_checking_policy(tool_name, tool_input, context):
+        statuses.append(await holder["client"].get_mcp_status())
+        path = tool_input.get("file_path", "")
+        if path.startswith("/etc/"):
+            return PermissionResultDeny(message=f"Refusing to write to system path: {path}")
+        return PermissionResultAllow(
+            updated_input={**tool_input, "file_path": "./safe_output/" + posixpath.basename(path)}
+        )
+
+    async def scenario() -> None:
+        options = ClaudeAgentOptions(can_use_tool=health_checking_policy)
+        async with replay_tape(
+            load_tape(permission),
+            options=options,
+            mode="verify",
+            lockstep=True,
+            tolerate_subtypes={"mcp_status"},
+        ) as client:
+            holder["client"] = client
+            async for message in client.receive_messages():
+                if isinstance(message, ResultMessage):
+                    break
+
+    await asyncio.wait_for(scenario(), _TIMEOUT_S)
+    assert statuses == [{"mcpServers": []}, {"mcpServers": []}]
+
+
+async def test_tolerate_subtypes_requires_lockstep():
+    """Demux has no sync points to tolerate at — passing tolerate_subtypes with
+    a tape that resolves to demux must raise, not silently do nothing."""
+    tape = [
+        _control_write("req_1_rec", "initialize"),
+        _control_read("req_1_rec", {}),
+    ]
+
+    async def scenario() -> None:
+        async with replay_tape(tape, tolerate_subtypes={"mcp_status"}):
+            pass
+
+    with pytest.raises(ValueError, match="lockstep"):
         await asyncio.wait_for(scenario(), _TIMEOUT_S)

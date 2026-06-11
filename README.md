@@ -228,6 +228,18 @@ the CLI doesn't proceed past a pending decision), so the terminal result can't r
 still-running callback. Force either model with `replay_tape(..., lockstep=True/False)`.
 Recorder: [`examples/record_stop_session.py`](examples/record_stop_session.py).
 
+**Foreign tapes.** A tape is not consumer-neutral: a consumer whose connect/turn path
+adds its own read-only side-calls (say a `get_mcp_status()` health check) can't replay a
+tape recorded by a *different* consumer — strict lockstep fails closed on the first
+unrecorded call. `replay_tape(..., tolerate_subtypes={"mcp_status"})` answers such a
+live call with a synthetic **empty** success (`{"mcpServers": []}` — never recorded
+data), but only when no remaining recorded sync point records that subtype: a subtype
+the tape records later is held for strict matching there, so tolerance can never steal
+a recorded exchange or shadow recorded content. Only read-only telemetry subtypes
+(`mcp_status`, `get_context_usage`) are accepted — anything intent-bearing raises
+`ValueError` at construction. Default is off; for first-party fidelity, record with
+your own consumer instead.
+
 ## pytest plugin (record-on-miss, VCR-style)
 
 Installing the package registers a pytest plugin (inert unless used). One marker
@@ -293,7 +305,7 @@ offline):
 | --- | --- |
 | `record()` | CM that wraps the SDK's transport to capture a session's full duplex wire as a tape |
 | `replay(frames, options=None)` | async CM → a connected `ClaudeSDKClient` replaying raw frames |
-| `replay_tape(tape, options=None, mode=..., lockstep=None, sync_timeout=5.0)` | async CM → replay a full duplex tape incl. the control plane; `ReplayMode = "inert" \| "stub" \| "verify"`; `lockstep=None` auto-selects lockstep for interrupt tapes |
+| `replay_tape(tape, options=None, mode=..., lockstep=None, sync_timeout=5.0, tolerate_subtypes=None)` | async CM → replay a full duplex tape incl. the control plane; `ReplayMode = "inert" \| "stub" \| "verify"`; `lockstep=None` auto-selects lockstep for interrupt tapes; `tolerate_subtypes` answers unrecorded read-only side-calls on foreign tapes (lockstep only) |
 | `save_tape(tape, path)` / `load_tape(path)` | tape I/O (JSONL) |
 | `load_frames(path)` | load a frames file for `replay()` |
 | `inbound_frames(tape)` / `conversation_frames(tape)` | derive frame views from a tape (all inbound / conversation-only) |
@@ -305,7 +317,7 @@ offline):
 | `check_drift(tape)` / `parse_drift(frames)` → `list[DriftFinding]` | drift findings vs the installed SDK |
 | `unmodeled_fields(frames)` / `field_drift(frames, baseline)` | field-level drift: recorded fields the installed SDK silently ignores |
 | `ReplayTransport(frames)` / `.from_tape(tape, keep_subtypes=None)` | the transport under `replay`/`replay_tape`, for wiring a client by hand |
-| `LockstepReplayTransport(tape, keep_subtypes=None, sync_timeout=5.0)` | recorded-interleaving replay — sync points at recorded control writes (interrupt tapes) |
+| `LockstepReplayTransport(tape, keep_subtypes=None, sync_timeout=5.0, tolerate_subtypes=None)` | recorded-interleaving replay — sync points at recorded control writes (interrupt tapes) |
 | `RecordingTransport(inner, tape)` | passive MITM tee, both directions |
 | `CassetteMismatchError` | replay diverged from the recording (always fail-closed) |
 | `TapeEntry` / `Frame` | the tape entry and raw-frame types |
