@@ -310,7 +310,12 @@ class LockstepReplayTransport(Transport):
     the tape ends. The one state that cannot answer is the walk suspended on
     conversation back-pressure (full SDK message buffer, consumer not
     draining): the call then resolves at the caller's own timeout, harmlessly.
-    For first-party fidelity, record with your own consumer instead.
+    Note that "read-only" describes the wire, not the consumer: a consumer
+    that branches on the canned answer (e.g. memoising "no MCP servers") has
+    its state shaped by it — usually exactly the inert behavior replay wants,
+    but it is the consumer's real code running on synthetic data, which is why
+    tolerance is opt-in. For first-party fidelity, record with your own
+    consumer instead.
 
     ``keep_subtypes`` selects the Direction-B view exactly as in
     :meth:`ReplayTransport.from_tape`: ``None`` drops every inbound
