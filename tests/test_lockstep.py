@@ -22,6 +22,7 @@ from pathlib import Path
 import posixpath
 
 import pytest
+from claude_agent_sdk import types as sdk_types
 from claude_agent_sdk import (
     ClaudeAgentOptions,
     ClaudeSDKClient,
@@ -452,7 +453,9 @@ async def test_post_tape_side_call_tolerated():
 async def test_get_context_usage_canned_shape_is_consumable():
     """The synthetic get_context_usage answer must carry every required key of
     the SDK's ContextUsageResponse — a missing one surfaces as a consumer
-    KeyError on a tolerated call."""
+    KeyError on a tolerated call. Asserted against the *installed* SDK's
+    TypedDict so the CI matrix turns an SDK bump that adds a required key into
+    a signal (review finding)."""
     tape = [
         _control_write("req_1_rec", "initialize"),
         _control_read("req_1_rec", {}),
@@ -469,8 +472,107 @@ async def test_get_context_usage_canned_shape_is_consumable():
             return usage
 
     usage = await asyncio.wait_for(scenario(), _TIMEOUT_S)
+    response_type = getattr(sdk_types, "ContextUsageResponse", None)
+    if response_type is not None:  # SDK versions in the matrix may predate it
+        assert set(usage) >= response_type.__required_keys__
     assert usage["percentage"] == 0.0
     assert usage["categories"] == []
+
+
+async def test_subtype_becomes_tolerable_once_its_recorded_sync_passes():
+    """The enabling half of decrement-after-match: a second live call of a
+    subtype the tape recorded *once* must be tolerated after that sync passes —
+    without the decrement, the stale count holds the call for matching and the
+    next sync point reports a false divergence (mutation-testing finding)."""
+    tape = [
+        _control_write("req_1_rec", "initialize"),
+        _control_read("req_1_rec", {}),
+        _control_write("req_2_rec", "mcp_status"),
+        _control_read("req_2_rec", {"mcpServers": [{"name": "recorded"}]}),
+        _control_write("req_3_rec", "interrupt"),
+        _control_read("req_3_rec", {}),
+    ]
+
+    async def scenario() -> tuple[dict, dict]:
+        async with replay_tape(
+            tape, lockstep=True, tolerate_subtypes={"mcp_status"}
+        ) as client:
+            first = await client.get_mcp_status()  # matches the recorded sync
+            second = await client.get_mcp_status()  # past it — tolerated
+            await client.interrupt()
+            return first, second
+
+    first, second = await asyncio.wait_for(scenario(), _TIMEOUT_S)
+    assert first == {"mcpServers": [{"name": "recorded"}]}
+    assert second == {"mcpServers": []}
+
+
+async def test_side_call_resolves_during_long_pre_sync_section():
+    """The adversarial-review regression: a connect-time health check on a tape
+    with more pre-sync frames than the SDK's inbound buffer (100). The walker
+    suspends on backpressure long before the next sync point, so a park-only
+    tolerance never answers and the blocked consumer deadlocks — the call must
+    be serviced while the walk is still pumping the section."""
+    tape = [_control_write("req_1_rec", "initialize"), _control_read("req_1_rec", {})]
+    tape += [
+        {"dir": "read", "frame": {"type": "system", "subtype": "status", "i": i}}
+        for i in range(130)
+    ]
+    tape += [_control_write("req_2_rec", "interrupt"), _control_read("req_2_rec", {})]
+
+    async def scenario() -> dict:
+        async with replay_tape(
+            tape, lockstep=True, tolerate_subtypes={"mcp_status"}
+        ) as client:
+            status = await client.get_mcp_status()  # before any draining
+            count = 0
+            async for _message in client.receive_messages():
+                count += 1
+                if count == 130:
+                    await client.interrupt()
+                    break
+            return status
+
+    assert await asyncio.wait_for(scenario(), _TIMEOUT_S) == {"mcpServers": []}
+
+
+async def test_direction_b_park_services_tolerated_side_calls():
+    """A can_use_tool callback that health-checks before deciding: the walk is
+    parked on the pending Direction-B answer, which the callback can't produce
+    until its tolerated side-call is answered. Pre-fix this starved until
+    sync_timeout and surfaced as a misleading "callback never answered"
+    divergence (review finding)."""
+    permission = (
+        Path(__file__).parent.parent / "examples" / "cassettes" / "permission_session.jsonl"
+    )
+    holder: dict = {}
+    statuses: list[dict] = []
+
+    async def health_checking_policy(tool_name, tool_input, context):
+        statuses.append(await holder["client"].get_mcp_status())
+        path = tool_input.get("file_path", "")
+        if path.startswith("/etc/"):
+            return PermissionResultDeny(message=f"Refusing to write to system path: {path}")
+        return PermissionResultAllow(
+            updated_input={**tool_input, "file_path": "./safe_output/" + posixpath.basename(path)}
+        )
+
+    async def scenario() -> None:
+        options = ClaudeAgentOptions(can_use_tool=health_checking_policy)
+        async with replay_tape(
+            load_tape(permission),
+            options=options,
+            mode="verify",
+            lockstep=True,
+            tolerate_subtypes={"mcp_status"},
+        ) as client:
+            holder["client"] = client
+            async for message in client.receive_messages():
+                if isinstance(message, ResultMessage):
+                    break
+
+    await asyncio.wait_for(scenario(), _TIMEOUT_S)
+    assert statuses == [{"mcpServers": []}, {"mcpServers": []}]
 
 
 async def test_tolerate_subtypes_requires_lockstep():
