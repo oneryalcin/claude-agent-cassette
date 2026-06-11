@@ -62,6 +62,7 @@ async def replay_tape(
     *,
     lockstep: Optional[bool] = None,
     sync_timeout: float = 5.0,
+    tolerate_subtypes: Optional[set[str]] = None,
 ) -> AsyncIterator[ClaudeSDKClient]:
     """Drive a real ``ClaudeSDKClient`` over a full **duplex tape** via ``from_tape``.
 
@@ -110,6 +111,19 @@ async def replay_tape(
     and in ``stub``/``verify`` modes a delivered Direction-B request must be
     answered before the replay advances.
 
+    **Foreign tapes** (issue #30). A tape recorded by a *different* consumer
+    cannot contain the read-only side-calls this consumer's connect/turn path
+    adds (e.g. a ``get_mcp_status()`` health check), so strict lockstep would
+    fail closed on the first one. ``tolerate_subtypes={"mcp_status"}`` answers
+    such a live call with a synthetic **empty** success (never recorded data)
+    instead — but only when no remaining recorded sync point records that
+    subtype; a subtype the tape records later is held for strict matching
+    there. Only read-only telemetry subtypes (``mcp_status``,
+    ``get_context_usage``) are accepted; anything intent-bearing raises
+    ``ValueError``. Lockstep-only: combining it with ``lockstep=False`` (or a
+    tape that auto-selects demux) raises. Default is empty — fail-closed
+    behavior is unchanged unless you opt in.
+
     As with :func:`replay`, break at the terminal ``ResultMessage``; the stream stays
     open after it and ends on ``disconnect()``.
 
@@ -121,11 +135,19 @@ async def replay_tape(
                     break
     """
     use_lockstep = records_interrupt(tape) if lockstep is None else lockstep
+    if tolerate_subtypes and not use_lockstep:
+        raise ValueError(
+            "tolerate_subtypes is a lockstep feature (the demux model has no "
+            "sync points to tolerate at) — pass lockstep=True to force it"
+        )
 
     def build_transport(keep_subtypes: Optional[set[str]] = None):
         if use_lockstep:
             return LockstepReplayTransport(
-                tape, keep_subtypes=keep_subtypes, sync_timeout=sync_timeout
+                tape,
+                keep_subtypes=keep_subtypes,
+                sync_timeout=sync_timeout,
+                tolerate_subtypes=tolerate_subtypes,
             )
         return ReplayTransport.from_tape(tape, keep_subtypes=keep_subtypes)
 

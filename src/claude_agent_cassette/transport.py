@@ -15,7 +15,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
-from collections import deque
+from collections import Counter, deque
 from typing import Any, AsyncIterator, Optional
 
 from claude_agent_sdk import Transport
@@ -217,6 +217,32 @@ class ReplayTransport(Transport):
             await self._queue.put(_END)
 
 
+# Synthetic answers for tolerated side-calls (issue #30). Only read-only
+# telemetry subtypes are tolerable: answering an intent-bearing call
+# (interrupt, set_model, set_permission_mode, ...) synthetically would certify
+# a session the recording never had. Shapes are the minimal truthful-empty
+# form of the installed SDK's response TypedDicts (``McpStatusResponse``,
+# ``ContextUsageResponse``); a future SDK that adds a required key would
+# surface as a consumer KeyError on a tolerated call — acceptable for a
+# foreign-tape convenience.
+_TOLERABLE_CONTROL_RESPONSES: dict[str, dict[str, Any]] = {
+    "mcp_status": {"mcpServers": []},
+    "get_context_usage": {
+        "categories": [],
+        "totalTokens": 0,
+        "maxTokens": 0,
+        "rawMaxTokens": 0,
+        "percentage": 0.0,
+        "model": "",
+        "isAutoCompactEnabled": False,
+        "memoryFiles": [],
+        "mcpTools": [],
+        "agents": [],
+        "gridRows": [],
+    },
+}
+
+
 class LockstepReplayTransport(Transport):
     """Replays a duplex tape **in recorded interleaving**: reads are delivered in
     tape order, and each recorded SDK ``control_request`` write is a *sync point*
@@ -266,6 +292,26 @@ class LockstepReplayTransport(Transport):
     control call's exception (``interrupt()`` raises it directly); a consumer
     blocked in ``receive_messages()`` sees it as the stream error message.
 
+    ``tolerate_subtypes`` (issue #30) relaxes exactly one of those divergences,
+    opt-in, for **foreign tapes** — a tape recorded by a different consumer
+    cannot contain the side-calls *this* consumer's connect/turn path adds
+    (e.g. a ``get_mcp_status()`` health check). A live control_request whose
+    subtype is in the set is answered with a synthetic **empty** success (never
+    recorded data: ``mcp_status`` → ``{"mcpServers": []}``) instead of failing
+    the walk — but only when **no remaining recorded sync point records that
+    subtype**. The remaining tape is the arbiter: if the tape records the
+    subtype later, the live write is held for strict matching there (answering
+    it synthetically would orphan the recorded sync point; issuing it *before*
+    the tape's recorded order remains divergence). Only read-only telemetry
+    subtypes are accepted — an intent-bearing subtype in the set raises
+    ``ValueError`` at construction. Tolerated calls are answered while the walk
+    is parked at a sync point or after the tape ends; a side-call made while
+    the walk is suspended on conversation back-pressure (full SDK message
+    buffer, consumer not draining) cannot be answered until the consumer drains
+    — it resolves at the caller's own timeout, harmlessly, and the queued write
+    is absorbed at the next sync point. For first-party fidelity, record with
+    your own consumer instead of tolerating.
+
     ``keep_subtypes`` selects the Direction-B view exactly as in
     :meth:`ReplayTransport.from_tape`: ``None`` drops every inbound
     ``control_request`` (inert), a set keeps those subtypes so the (stubbed or
@@ -279,10 +325,34 @@ class LockstepReplayTransport(Transport):
         tape: list[TapeEntry],
         keep_subtypes: set[str] | None = None,
         sync_timeout: float = 5.0,
+        tolerate_subtypes: Optional[set[str]] = None,
     ) -> None:
         self._tape = tape
         self._keep_subtypes = keep_subtypes
         self._sync_timeout = sync_timeout
+        self._tolerate = frozenset(tolerate_subtypes or ())
+        unknown = self._tolerate - set(_TOLERABLE_CONTROL_RESPONSES)
+        if unknown:
+            raise ValueError(
+                f"tolerate_subtypes {sorted(unknown)} are not tolerable — only "
+                f"read-only telemetry subtypes "
+                f"{sorted(_TOLERABLE_CONTROL_RESPONSES)} can be answered "
+                "synthetically; tolerating an intent-bearing control call would "
+                "certify a session the recording never had"
+            )
+        # Multiset of recorded Direction-A sync subtypes the walk has not yet
+        # passed — the arbiter for tolerance (issue #30): a live tolerated
+        # subtype is answered synthetically iff no remaining sync point records
+        # it. Decremented as each sync point is matched, so at any park the
+        # current sync's own subtype still counts as remaining (a live write of
+        # that subtype goes to strict matching, never to tolerance).
+        self._remaining_syncs = Counter(
+            control_request_subtype(payload)
+            for entry in tape
+            if entry.get("dir") == "write"
+            and (payload := _write_payload(entry)) is not None
+            and payload.get("type") == "control_request"
+        )
         # Live outbound control_requests, in write order; _END on close.
         self._live_control_writes: asyncio.Queue[Any] = asyncio.Queue()
         # request_ids of live outbound control_responses (Direction-B answers);
@@ -324,9 +394,23 @@ class LockstepReplayTransport(Transport):
                 if recorded is None:
                     continue
                 if recorded.get("type") == "control_request":
-                    live = await self._matching_live_request(recorded)
-                    if live is _END:
-                        return
+                    # Park until the live SDK writes the request this sync point
+                    # records, answering tolerated side-calls in the meantime
+                    # (inline: a synthetic answer must be *yielded* while still
+                    # parked — its caller may be what blocks the consumer from
+                    # ever issuing the sync call, e.g. a health check inside
+                    # connect()).
+                    live = None
+                    while live is None:
+                        candidate = await self._next_live_write(recorded)
+                        if candidate is _END:
+                            return
+                        if self._tolerable(candidate):
+                            yield self._synthetic_success(candidate)
+                            continue
+                        self._require_match(recorded, candidate)
+                        live = candidate
+                    self._remaining_syncs[control_request_subtype(recorded)] -= 1
                     live_id_by_recorded[recorded.get("request_id")] = live.get("request_id")
                 elif recorded.get("type") == "control_response":
                     # The SDK's recorded answer to a Direction-B request: wait for
@@ -357,34 +441,42 @@ class LockstepReplayTransport(Transport):
             live = await self._live_control_writes.get()
             if live is _END:
                 return
+            if self._tolerable(live):
+                # Every recorded sync point has passed, so any tolerated subtype
+                # is by definition unrecorded here — e.g. a health check after
+                # the recorded session ended.
+                yield self._synthetic_success(live)
+                continue
             raise CassetteMismatchError(
                 f"cassette mismatch: live control_request "
                 f"{control_request_subtype(live)!r} after the tape ended — no "
                 "recorded response remains"
             )
 
-    async def _matching_live_request(self, recorded: Frame) -> Any:
-        """Block until the live SDK writes the control_request this sync point records.
+    async def _next_live_write(self, recorded: Frame) -> Any:
+        """The next live control_request write (or ``_END``), bounded by ``sync_timeout``.
 
-        Returns the live request frame (or ``_END`` if the consumer disconnected
-        while the walk waited). A different live subtype, or no live write within
-        ``sync_timeout``, is divergence.
+        The walk is parked at the sync point recording ``recorded``; the timeout
+        message names it. Each tolerated side-call answered while parked resets
+        the bound — progress is being made.
         """
-        subtype = control_request_subtype(recorded)
         try:
-            live = await asyncio.wait_for(
+            return await asyncio.wait_for(
                 self._live_control_writes.get(), self._sync_timeout
             )
         except asyncio.TimeoutError:
             raise CassetteMismatchError(
-                f"cassette mismatch: tape records a control_request {subtype!r} "
-                f"here, but the live client wrote none within {self._sync_timeout}s "
+                f"cassette mismatch: tape records a control_request "
+                f"{control_request_subtype(recorded)!r} here, but the live client "
+                f"wrote none within {self._sync_timeout}s "
                 "— the replay reached the recorded exchange and the live session "
                 "never issued it (e.g. an interrupt tape replayed by a consumer "
                 "that never calls interrupt())"
             ) from None
-        if live is _END:
-            return live
+
+    def _require_match(self, recorded: Frame, live: Frame) -> None:
+        """Fail closed unless ``live`` is the control_request this sync point records."""
+        subtype = control_request_subtype(recorded)
         live_subtype = control_request_subtype(live)
         if live_subtype != subtype:
             raise CassetteMismatchError(
@@ -406,7 +498,29 @@ class LockstepReplayTransport(Transport):
                     f"not match the recorded arguments — recorded "
                     f"{recorded_args!r}, live {live_args!r}"
                 )
-        return live
+
+    def _tolerable(self, live: Any) -> bool:
+        """A live request answerable synthetically: tolerated subtype, and no
+        remaining recorded sync point records it. The remaining tape is the
+        arbiter — answering a subtype the tape still records would steal the
+        live write from its recorded sync point and orphan it (issue #30)."""
+        subtype = control_request_subtype(live)
+        return subtype in self._tolerate and not self._remaining_syncs[subtype]
+
+    def _synthetic_success(self, live: Frame) -> Frame:
+        """A synthetic empty success for a tolerated side-call — never recorded
+        data. Deep-copied so a consumer mutating one answer cannot contaminate
+        the next."""
+        subtype = control_request_subtype(live)
+        assert subtype is not None  # _tolerable() admitted it, so it's allowlisted
+        return {
+            "type": "control_response",
+            "response": {
+                "subtype": "success",
+                "request_id": live.get("request_id"),
+                "response": copy.deepcopy(_TOLERABLE_CONTROL_RESPONSES[subtype]),
+            },
+        }
 
     async def _live_b_answer(self, request_id: Any) -> bool:
         """Block until the live SDK writes its control_response for ``request_id``.
