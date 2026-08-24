@@ -49,7 +49,7 @@ from .transport import (
     ReplayTransport,
 )
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 
 __all__ = [
     # record & replay (the core loop)

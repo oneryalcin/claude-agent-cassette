@@ -24,7 +24,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "pytest-asyncio>=0.23"]
+dev = ["build>=1.2", "hatchling>=1.25", "pytest>=8", "pytest-asyncio>=0.23"]
 
 [project.urls]
 Homepage = "https://github.com/oneryalcin/claude-agent-cassette"
@@ -40,6 +40,12 @@ path = "src/claude_agent_cassette/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/claude_agent_cassette"]
+
+# Source releases are built from an explicit allowlist. Hatchling otherwise
+# includes every VCS-unignored file in the working tree, which can publish
+# local tool state when a release is built from a dirty checkout.
+[tool.hatch.build.targets.sdist]
+only-include = ["src", "tests", "examples", "ROADMAP.md"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
