@@ -84,10 +84,13 @@ def test_sdist_has_an_explicit_safe_file_set(tmp_path: Path) -> None:
     assert ".env" not in roots
     assert "uv.lock" not in roots
 
-    [mcp_requirement] = [
-        requirement
-        for requirement in pkg_info.get_all("Requires-Dist", [])
-        if requirement.startswith("mcp")
+    requirements = pkg_info.get_all("Requires-Dist", [])
+    [sdk_requirement] = [
+        requirement for requirement in requirements if requirement.startswith("claude-agent-sdk")
     ]
+    assert ">=0.2.82" in sdk_requirement
+    assert "<0.2.144" in sdk_requirement
+
+    [mcp_requirement] = [requirement for requirement in requirements if requirement.startswith("mcp")]
     assert ">=1" in mcp_requirement
     assert "<2" in mcp_requirement
