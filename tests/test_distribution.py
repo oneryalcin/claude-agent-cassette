@@ -89,7 +89,7 @@ def test_sdist_has_an_explicit_safe_file_set(tmp_path: Path) -> None:
         requirement for requirement in requirements if requirement.startswith("claude-agent-sdk")
     ]
     assert ">=0.2.82" in sdk_requirement
-    assert "<0.2.143" in sdk_requirement
+    assert "<0.2.140" in sdk_requirement
 
     [mcp_requirement] = [requirement for requirement in requirements if requirement.startswith("mcp")]
     assert ">=1" in mcp_requirement
