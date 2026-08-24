@@ -34,9 +34,9 @@ jobs:
       - name: Pin claude-agent-sdk for this matrix cell
         run: |
           if [ "${{ matrix.sdk }}" = "latest" ]; then
-            uv pip install -U "claude-agent-sdk>=0.2,<0.3"
+            uv pip install -U "claude-agent-sdk>=0.2,<0.3" "mcp>=1,<2"
           else
-            uv pip install "claude-agent-sdk==${{ matrix.sdk }}"
+            uv pip install "claude-agent-sdk==${{ matrix.sdk }}" "mcp>=1,<2"
           fi
       - name: Resolved SDK (the version this cell guards)
         run: .venv/bin/python -c "import claude_agent_sdk as c; print('claude-agent-sdk', c.__version__)"
