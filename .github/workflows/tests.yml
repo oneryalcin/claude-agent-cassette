@@ -54,6 +54,6 @@ jobs:
           python-version: "3.12"
       - run: |
           uv venv
-          uv pip install -e ".[dev]" ruff mypy
+          uv pip install -e ".[dev]"
       - run: .venv/bin/ruff check src tests
       - run: .venv/bin/mypy src/claude_agent_cassette

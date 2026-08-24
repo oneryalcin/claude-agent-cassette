@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+from email.parser import Parser
 from pathlib import Path, PurePosixPath
 
 _IGNORED_COPY_DIRS = {
@@ -70,9 +71,23 @@ def test_sdist_has_an_explicit_safe_file_set(tmp_path: Path) -> None:
     [archive] = outdir.glob("*.tar.gz")
     with tarfile.open(archive) as sdist:
         members = [PurePosixPath(name) for name in sdist.getnames()]
+        [pkg_info_member] = [
+            member for member in sdist.getmembers() if PurePosixPath(member.name).name == "PKG-INFO"
+        ]
+        pkg_info_file = sdist.extractfile(pkg_info_member)
+        assert pkg_info_file is not None
+        pkg_info = Parser().parsestr(pkg_info_file.read().decode())
 
     roots = {path.parts[1] for path in members if len(path.parts) > 1}
     assert roots <= _ALLOWED_SDIST_ROOTS
     assert ".omx" not in roots
     assert ".env" not in roots
     assert "uv.lock" not in roots
+
+    [mcp_requirement] = [
+        requirement
+        for requirement in pkg_info.get_all("Requires-Dist", [])
+        if requirement.startswith("mcp")
+    ]
+    assert ">=1" in mcp_requirement
+    assert "<2" in mcp_requirement
